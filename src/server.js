@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createArtService } from './art.js';
 import { loadConfig } from './config.js';
-import { endPlay, getRecentPlays, mergeDuplicatePlays, openDb } from './db.js';
+import { endPlay, getRecentPlays, mergeDuplicatePlays, openDb, removeShortPlays } from './db.js';
 import { Enricher } from './enrichment.js';
 import { getMeta, getSummary, getTrackDetails, rangeBounds } from './stats.js';
 import { PlayTracker } from './play-detector.js';
@@ -81,12 +81,15 @@ function main() {
   const db = openDb(config.dataDir);
   const merged = mergeDuplicatePlays(db);
   if (merged) console.log(`merged ${merged} duplicate play segments`);
+  const skipped = removeShortPlays(db, config.minPlayMs);
+  if (skipped) console.log(`removed ${skipped} skipped plays under ${config.minPlayMs}ms`);
   const art = createArtService(db, config.dataDir);
   const enricher = new Enricher(db, config);
   const backfilled = enricher.backfill();
   if (backfilled) console.log(`enriching ${backfilled} previously seen tracks with Last.fm tags`);
   const tracker = new PlayTracker(db, {
     pollIntervalMs: config.pollIntervalMs,
+    minPlayMs: config.minPlayMs,
     onPlayStarted: ({ track }) => enricher.enqueue(track),
   });
   const poller = new Poller({ config, db, tracker });

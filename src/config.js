@@ -8,6 +8,7 @@ const DEFAULTS = {
   dataDir: './data',
   pollIntervalMs: 5000,
   requestTimeoutMs: 2500,
+  minPlayMs: 30_000,
   devices: [],
   lastfm: { apiKey: '' },
 };
@@ -50,6 +51,8 @@ export function loadConfig({ configPath = defaultConfigPath(), createIfMissing =
 
   config.pollIntervalMs = Math.max(1000, Number(config.pollIntervalMs) || 5000);
   config.requestTimeoutMs = Math.max(500, Number(config.requestTimeoutMs) || 2500);
+  const minPlay = Number(config.minPlayMs ?? DEFAULTS.minPlayMs);
+  config.minPlayMs = Number.isFinite(minPlay) ? Math.max(0, minPlay) : DEFAULTS.minPlayMs;
   return config;
 }
 
@@ -60,6 +63,7 @@ export function saveConfig(config, configPath = defaultConfigPath()) {
     dataDir: config.dataDir,
     pollIntervalMs: config.pollIntervalMs,
     requestTimeoutMs: config.requestTimeoutMs,
+    minPlayMs: config.minPlayMs,
     devices: (config.devices ?? []).map(({ name, host }) => ({ name, host })),
     lastfm: { apiKey: config.lastfm?.apiKey ?? '' },
   };

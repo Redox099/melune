@@ -10,6 +10,7 @@ import {
   getOrCreateTrack,
   mergeDuplicatePlays,
   openDb,
+  removeShortPlays,
   startPlay,
   updatePlayTick,
   upsertDevice,
@@ -97,6 +98,7 @@ test('play tracking dedupes polls and ignores pause time', () => {
     const started = [];
     const tracker = new PlayTracker(db, {
       pollIntervalMs: 5000,
+      minPlayMs: 0,
       onPlayStarted: (play) => started.push(play),
     });
     const observation = (at, status, track, positionMs) => ({
@@ -135,7 +137,7 @@ test('stats aggregate plays from SQLite', () => {
   try {
     const db = openDb(dir);
     upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
-    const tracker = new PlayTracker(db, { pollIntervalMs: 5000 });
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
     const at = Date.now();
     tracker.observe('d1', { at: at - 60_000, status: 'play', source: 'spotify', positionMs: 0, track: { title: 'One', artist: 'Artist' } });
     tracker.observe('d1', { at: at - 55_000, status: 'play', source: 'spotify', positionMs: 5000, track: { title: 'One', artist: 'Artist' } });
@@ -194,7 +196,7 @@ test('a brief stop and resume of the same track counts as one play', () => {
   try {
     const db = openDb(dir);
     upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
-    const tracker = new PlayTracker(db, { pollIntervalMs: 5000 });
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
     const track = { title: 'One', artist: 'Artist' };
     const observe = (at, status, positionMs) => tracker.observe('d1', {
       at,
@@ -227,7 +229,7 @@ test('a real repeat is still a separate play', () => {
   try {
     const db = openDb(dir);
     upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
-    const tracker = new PlayTracker(db, { pollIntervalMs: 5000 });
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
     const track = { title: 'One', artist: 'Artist' };
     const observe = (at, status, positionMs) => tracker.observe('d1', {
       at,
@@ -256,7 +258,7 @@ test('a track change keeps the old play end position', () => {
   try {
     const db = openDb(dir);
     upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
-    const tracker = new PlayTracker(db, { pollIntervalMs: 5000 });
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
     tracker.observe('d1', {
       at: 1000, status: 'play', source: 'wiim', positionMs: 1000,
       track: { title: 'One', artist: 'Artist' },
@@ -293,11 +295,11 @@ test('an open play survives a tracker restart', () => {
       positionMs,
       track,
     });
-    const first = new PlayTracker(db, { pollIntervalMs: 5000 });
+    const first = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
     observe(first, 1000, 0);
     observe(first, 6000, 5000);
 
-    const second = new PlayTracker(db, { pollIntervalMs: 5000 });
+    const second = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
     observe(second, 11000, 10_000);
     observe(second, 21000, 20_000);
 
@@ -334,6 +336,83 @@ test('stored duplicate segments are merged on cleanup', () => {
     assert.equal(plays[0].played_ms, 9000);
     assert.equal(plays[0].ended_at, 16_000);
     assert.equal(plays[0].position_end_ms, 13_000);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a track skipped after a few seconds is not counted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-skip-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 30_000 });
+    const observe = (at, track, positionMs) => tracker.observe('d1', {
+      at, status: 'play', source: 'wiim', positionMs, track,
+    });
+    const skipped = { title: 'Skipped', artist: 'Artist' };
+    const kept = { title: 'Kept', artist: 'Artist' };
+
+    observe(1000, skipped, 0);
+    observe(6000, skipped, 5000);
+    observe(11_000, kept, 0);
+
+    const plays = db.prepare('SELECT t.title, p.played_ms FROM plays p JOIN tracks t ON t.id = p.track_id').all();
+    assert.equal(plays.length, 1);
+    assert.equal(plays[0].title, 'Kept');
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a track played past the threshold is still counted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-kept-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 30_000 });
+    const track = { title: 'Kept', artist: 'Artist' };
+    const observe = (at, positionMs) => tracker.observe('d1', {
+      at, status: 'play', source: 'wiim', positionMs, track,
+    });
+
+    observe(1000, 0);
+    observe(11_000, 10_000);
+    observe(21_000, 20_000);
+    observe(31_000, 30_000);
+    observe(41_000, 40_000);
+    tracker.observe('d1', {
+      at: 51_000, status: 'stop', source: 'wiim', positionMs: 40_000, track,
+    });
+
+    const plays = db.prepare('SELECT * FROM plays ORDER BY id').all();
+    assert.equal(plays.length, 1);
+    assert.equal(plays[0].played_ms, 40_000);
+    assert.equal(plays[0].ended_at, 51_000);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('short stored plays are removed on cleanup', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-cleanup-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const short = getOrCreateTrack(db, { title: 'Short', artist: 'Artist' });
+    const long = getOrCreateTrack(db, { title: 'Long', artist: 'Artist' });
+    const a = startPlay(db, { deviceId: 'd1', trackId: short, startedAt: 1000, source: 'wiim' });
+    updatePlayTick(db, a, 10_000, 10_000);
+    endPlay(db, a, 11_000, 10_000);
+    const b = startPlay(db, { deviceId: 'd1', trackId: long, startedAt: 20_000, source: 'wiim' });
+    updatePlayTick(db, b, 40_000, 40_000);
+    endPlay(db, b, 60_000, 40_000);
+
+    assert.equal(removeShortPlays(db, 30_000), 1);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM plays').get().n, 1);
     db.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

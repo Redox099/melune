@@ -44,6 +44,7 @@ set it manually.
 | `dataDir` | `./data` | Where `melune.db` (SQLite) is stored. |
 | `pollIntervalMs` | `5000` | How often each WiiM is polled. 5s is a good tradeoff. |
 | `requestTimeoutMs` | `2500` | Per-device request timeout. |
+| `minPlayMs` | `30000` | Plays shorter than this are skipped tracks and are not counted. Set to `0` to keep every play. |
 | `devices` | `[]` | Array of `{ "name": "...", "host": "192.168.1.50" }`. |
 | `lastfm.apiKey` | `""` | Optional; enables tag-based mood inference. |
 
@@ -76,6 +77,9 @@ tracks play sessions per device:
   A real repeat (position jumps back near the start) still counts as a new play.
   The same cleanup runs on startup and after each poll, so older split plays
   are repaired automatically.
+- **Skipped tracks are discarded.** A play shorter than `minPlayMs` (30s by
+  default) is deleted instead of counted. Existing short plays are cleaned up
+  on startup, and the threshold can be changed in `config.json`.
 - WiiM metadata is often UTF-8 encoded as hex; melune decodes it and treats
   `unknow`/`Unknown` as missing.
 - Tracks are keyed by normalized artist + title + album, so the same song from

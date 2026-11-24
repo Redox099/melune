@@ -1,4 +1,4 @@
-import { endPlay, getOpenPlay, getOrCreateTrack, reopenPlay, startPlay, updatePlayTick } from './db.js';
+import { finishPlay, getOpenPlay, getOrCreateTrack, reopenPlay, startPlay, updatePlayTick } from './db.js';
 import { fingerprint, nowMs } from './util.js';
 
 const ACTIVE_STATES = new Set(['play', 'loading']);
@@ -13,12 +13,14 @@ function hasMetadata(track) {
  * Turns a stream of WiiM status polls into discrete play events.
  * A new play starts on a metadata change, a source change, a position rewind,
  * or a long polling gap. Brief stop/start transitions on the same track are
- * merged back into the same play so one song is not counted twice.
+ * merged back into the same play so one song is not counted twice. Plays that
+ * end before minPlayMs are discarded as skips.
  */
 export class PlayTracker {
-  constructor(db, { pollIntervalMs = 5000, onPlayStarted = () => {} } = {}) {
+  constructor(db, { pollIntervalMs = 5000, minPlayMs = 30_000, onPlayStarted = () => {} } = {}) {
     this.db = db;
     this.onPlayStarted = onPlayStarted;
+    this.minPlayMs = Math.max(0, minPlayMs);
     this.maxTickMs = Math.max(pollIntervalMs * 2, 15_000);
     this.gapThresholdMs = Math.max(pollIntervalMs * 4, 60_000);
     this.resumeGapMs = Math.max(pollIntervalMs * 3, 15_000);
@@ -28,7 +30,7 @@ export class PlayTracker {
 
   canResume(state, stateKey, source, positionMs, at) {
     const last = state.lastPlay;
-    if (!last || last.key !== stateKey || last.source !== source) return false;
+    if (!last?.playId || last.key !== stateKey || last.source !== source) return false;
     if (at - (last.lastSeenAt ?? 0) > this.resumeGapMs) return false;
     if (
       positionMs !== null &&
@@ -107,9 +109,9 @@ export class PlayTracker {
       const endedPosition =
         reason === 'stopped' ? positionMs ?? state.lastPosition : state.lastPosition;
       if (state.playId) {
-        endPlay(this.db, state.playId, at, endedPosition);
+        const finished = finishPlay(this.db, state.playId, at, endedPosition, this.minPlayMs);
         state.lastPlay = {
-          playId: state.playId,
+          playId: finished.discarded ? null : state.playId,
           key: state.key,
           source: state.source,
           trackId: state.trackId,

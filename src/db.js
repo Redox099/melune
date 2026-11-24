@@ -147,6 +147,27 @@ export function endPlay(db, playId, endedAt, positionEndMs = null) {
   return result.changes > 0;
 }
 
+/** Close a play and discard it when the listener skipped it too quickly. */
+export function finishPlay(db, playId, endedAt, positionEndMs = null, minPlayMs = 0) {
+  const row = db.prepare('SELECT played_ms FROM plays WHERE id = ? AND ended_at IS NULL').get(playId);
+  if (!row || !endPlay(db, playId, endedAt, positionEndMs)) {
+    return { ended: false, discarded: false };
+  }
+  if (minPlayMs > 0 && (row.played_ms ?? 0) < minPlayMs) {
+    db.prepare('DELETE FROM plays WHERE id = ?').run(playId);
+    return { ended: true, discarded: true };
+  }
+  return { ended: true, discarded: false };
+}
+
+/** Remove short plays already stored, e.g. after changing the threshold. */
+export function removeShortPlays(db, minPlayMs = 0) {
+  if (minPlayMs <= 0) return 0;
+  return db.prepare(`
+    DELETE FROM plays WHERE ended_at IS NOT NULL AND played_ms < ?
+  `).run(minPlayMs).changes;
+}
+
 export function reopenPlay(db, playId) {
   const result = db.prepare(`
     UPDATE plays SET ended_at = NULL WHERE id = ? AND ended_at IS NOT NULL
