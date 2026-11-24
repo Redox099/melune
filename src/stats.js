@@ -45,7 +45,7 @@ export function getSummary(db, options = {}) {
      WHERE ${sql}
      GROUP BY t.id
      ORDER BY plays DESC, playedMs DESC
-     LIMIT 15
+     LIMIT 20
   `).all(...params);
 
   const topArtists = db.prepare(`
@@ -57,7 +57,7 @@ export function getSummary(db, options = {}) {
      WHERE ${sql}
      GROUP BY artist
      ORDER BY plays DESC, tracks DESC
-     LIMIT 10
+     LIMIT 8
   `).all(...params);
 
   const moods = db.prepare(`
@@ -81,14 +81,37 @@ export function getSummary(db, options = {}) {
   `).all(...params);
 
   const timeline = db.prepare(`
-    SELECT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch') AS day,
-           COUNT(*) AS plays,
-           COALESCE(SUM(p.played_ms), 0) AS playedMs
-      FROM plays p
-     WHERE ${sql}
-     GROUP BY day
-     ORDER BY day
-  `).all(...params);
+    WITH day_counts AS (
+      SELECT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch') AS day,
+             COUNT(*) AS plays,
+             COALESCE(SUM(p.played_ms), 0) AS playedMs
+        FROM plays p
+       WHERE ${sql}
+       GROUP BY day
+    ), day_moods AS (
+      SELECT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch') AS day,
+             COALESCE(m.mood, 'unknown') AS mood,
+             COUNT(*) AS moodPlays
+        FROM plays p
+        JOIN tracks t ON t.id = p.track_id
+        LEFT JOIN track_mood m ON m.track_id = t.id
+       WHERE ${sql}
+       GROUP BY day, mood
+    ), ranked AS (
+      SELECT day, mood,
+             ROW_NUMBER() OVER (
+               PARTITION BY day
+               ORDER BY moodPlays DESC,
+                        CASE WHEN mood = 'unknown' THEN 1 ELSE 0 END,
+                        mood
+             ) AS rn
+        FROM day_moods
+    )
+    SELECT d.day, d.plays, d.playedMs, r.mood
+      FROM day_counts d
+      LEFT JOIN ranked r ON r.day = d.day AND r.rn = 1
+     ORDER BY d.day
+  `).all(...params, ...params);
 
   return {
     totals: {

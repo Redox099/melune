@@ -3,7 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#f6f7f9" />
+  <meta name="theme-color" content="#0a0b0c" />
+  <script>
+    (() => {
+      const light = new URLSearchParams(location.search).get('theme') === 'light';
+      document.documentElement.dataset.theme = light ? 'light' : 'dark';
+      document.querySelector('meta[name="theme-color"]').content = light ? '#f4f5f7' : '#0a0b0c';
+    })();
+  </script>
   <title>melune — listening history</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -26,19 +33,22 @@
     <main>
       <section class="controls" aria-label="Dashboard filters">
         <div class="tabs" id="range-tabs" role="group" aria-label="Date range">
-          <button type="button" data-range="today">Today</button>
-          <button type="button" data-range="week" class="active">7 days</button>
+          <button type="button" data-range="today" class="active">Today</button>
+          <button type="button" data-range="week">7 days</button>
           <button type="button" data-range="month">30 days</button>
           <button type="button" data-range="all">All time</button>
         </div>
-        <label class="select-wrap">
-          <span>Device</span>
-          <select id="device-select"><option value="">All devices</option></select>
-        </label>
+        <div class="controls-right">
+          <label class="select-wrap">
+            <span>Device</span>
+            <select id="device-select"><option value="">All devices</option></select>
+          </label>
+          <span class="control-divider" aria-hidden="true"></span>
+          <button type="button" class="discover-button" id="discover-button">Devices</button>
+        </div>
       </section>
 
       <section class="section" id="now-section">
-        <div class="section-head"><h2>Now playing</h2></div>
         <div class="now-grid" id="now-grid"></div>
       </section>
 
@@ -46,12 +56,11 @@
         <div class="kpi"><span class="kpi-label">Plays</span><strong id="kpi-plays">—</strong><span class="kpi-sub" id="kpi-days"></span></div>
         <div class="kpi"><span class="kpi-label">Different tracks</span><strong id="kpi-tracks">—</strong><span class="kpi-sub">unique songs</span></div>
         <div class="kpi"><span class="kpi-label">Time listened</span><strong id="kpi-time">—</strong><span class="kpi-sub">estimated from polls</span></div>
-        <div class="kpi"><span class="kpi-label">Mood</span><strong id="kpi-mood">—</strong><span class="kpi-sub" id="kpi-mood-sub">top mood this period</span></div>
       </section>
 
       <div class="columns">
         <section class="card">
-          <div class="section-head"><h2>Most played tracks</h2><span class="hint" id="tracks-hint"></span></div>
+          <div class="section-head"><h2>Most played tracks</h2></div>
           <ol class="rank-list" id="top-tracks"></ol>
         </section>
         <div class="stack">
@@ -59,7 +68,7 @@
             <div class="section-head"><h2>Mood mix</h2></div>
             <div class="mood-list" id="moods"></div>
           </section>
-          <section class="card">
+          <section class="card artists-card">
             <div class="section-head"><h2>Top artists</h2></div>
             <div class="artist-grid" id="artists"></div>
           </section>
@@ -67,12 +76,12 @@
       </div>
 
       <section class="card">
-        <div class="section-head"><h2>Activity</h2><span class="hint">plays per day</span></div>
+        <div class="section-head"><h2>Activity</h2><span class="hint" id="activity-hint"></span></div>
         <div class="timeline" id="timeline"></div>
       </section>
 
       <section class="card">
-        <div class="section-head"><h2>Recent plays</h2><span class="hint" id="plays-hint"></span></div>
+        <div class="section-head"><h2>Recent plays</h2></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>When</th><th>Track</th><th>Device</th><th>Source</th><th>Listened</th></tr></thead>
@@ -83,10 +92,25 @@
     </main>
 
     <footer>
-      <span>Data stays on this machine. Album art is cached locally; Last.fm is only contacted for tags when configured.</span>
+      <span>Data stays on this machine. Art is cached locally; Last.fm is contacted only for tags when configured, Deezer for artist photos.</span>
       <span id="footer-status"></span>
     </footer>
   </div>
+
+  <dialog class="discover-dialog" id="discover-dialog">
+    <form method="dialog" class="discover-head">
+      <div>
+        <h2>Devices</h2>
+        <p>Scan the local network and add devices to melune.</p>
+      </div>
+      <button type="submit" class="discover-close" aria-label="Close">×</button>
+    </form>
+    <div class="discover-tools">
+      <button type="button" id="discover-scan">Scan</button>
+    </div>
+    <p class="discover-status"><span class="scan-spinner" id="scan-spinner" aria-hidden="true" hidden></span><span id="discover-status">Press Scan to look for WiiM devices on your network.</span></p>
+    <div class="discover-results" id="discover-results"></div>
+  </dialog>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

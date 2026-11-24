@@ -124,8 +124,22 @@ const SOURCES = new Map([
   [99, 'slave'],
 ]);
 
-export function sourceName(mode) {
+// Physical inputs are identified by mode even when the device reports a vendor.
+const PHYSICAL_MODES = new Set([1, 2, 40, 41, 42, 43, 50, 99]);
+const RADIO_VENDORS = new Set(['vtuner', 'v-tuner', 'radio', 'internet-radio', 'iheartradio', 'tunein']);
+
+function sourceFromVendor(vendor) {
+  const name = cleanMeta(vendor);
+  if (!name) return null;
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  if (!slug) return null;
+  return RADIO_VENDORS.has(slug) ? 'radio' : slug;
+}
+
+export function sourceName(mode, vendor) {
   const value = toInt(mode, -1);
+  const fromVendor = sourceFromVendor(vendor);
+  if (fromVendor && !PHYSICAL_MODES.has(value)) return fromVendor;
   if (value === 0) return 'none';
   if (SOURCES.has(value)) return SOURCES.get(value);
   if (value >= 10 && value <= 19) return 'wiim';
@@ -157,7 +171,7 @@ export function normalizeObservation(player = {}, meta = {}, at = Date.now()) {
   return {
     at,
     status: String(p.status ?? '').trim().toLowerCase(),
-    source: sourceName(p.mode),
+    source: sourceName(p.mode, p.vendor),
     positionMs: toInt(p.curpos ?? p.offset_pts),
     durationMs: toInt(p.totlen),
     plicurr: toInt(p.plicurr),

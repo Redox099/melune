@@ -1,10 +1,20 @@
-const state = { range: 'week', device: '', moods: {} };
+const state = { range: 'today', device: '', moods: {} };
+const params = new URLSearchParams(location.search);
+const demoMode = params.get('demo') === '1';
+const lightTheme = params.get('theme') === 'light';
+const MOOD_FALLBACK = lightTheme ? '#64748b' : '#94a3b8';
+let configuredHosts = new Set();
+let configuredDevices = [];
+let discoveredDevices = [];
 const $ = (selector) => document.querySelector(selector);
 
 // Refresh polls often, but most of that data is unchanged. Remember what was
 // last painted so unchanged sections are left completely untouched — replacing
 // innerHTML recreates every cover <img> and makes the page visibly flicker.
 const painted = new Map();
+const lastTrackIds = new Map();
+const moodTokens = new Map();
+const MOOD_VARS = ['--mood-color', '--mood-border', '--mood-soft', '--mood-glow'];
 function paint(key, value, draw) {
   const signature = JSON.stringify(value);
   if (painted.get(key) === signature) return false;
@@ -45,7 +55,36 @@ function moodLabel(mood) {
 }
 
 function moodColor(mood) {
-  return state.moods?.[mood]?.color ?? '#6cc8ff';
+  return state.moods?.[mood]?.color ?? MOOD_FALLBACK;
+}
+
+function playingMoods() {
+  const active = new Set();
+  for (const device of configuredDevices) {
+    const current = device.current;
+    if (current && ['play', 'loading'].includes(current.status)
+      && current.mood && current.mood !== 'unknown') active.add(current.mood);
+  }
+  return active;
+}
+
+function updateMoodGlow() {
+  const active = playingMoods();
+  for (const row of document.querySelectorAll('#moods .mood-row[data-mood]')) {
+    row.classList.toggle('playing', active.has(row.dataset.mood));
+  }
+}
+
+function moodRgba(mood, alpha) {
+  const hex = String(moodColor(mood)).replace('#', '');
+  if (!/^[\da-f]{6}$/i.test(hex)) {
+    const fallback = MOOD_FALLBACK.slice(1);
+    return `rgba(${parseInt(fallback.slice(0, 2), 16)}, ${parseInt(fallback.slice(2, 4), 16)}, ${parseInt(fallback.slice(4, 6), 16)}, ${alpha})`;
+  }
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 function empty(message) {
@@ -60,9 +99,27 @@ function cover(trackId, hasArt, modifier = '') {
   return `<span class="cover${extra}" aria-hidden="true"><span class="cover-mark">♪</span>${image}</span>`;
 }
 
-async function api(path) {
-  const response = await fetch(path, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`${response.status} from ${path}`);
+function artistCover(artist) {
+  const src = `/api/artist-art/${encodeURIComponent(artist || '')}`;
+  return `<span class="cover cover-artist" aria-hidden="true"><span class="cover-mark">♪</span><img src="${src}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true"></span>`;
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    cache: 'no-store',
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
+  });
+  if (!response.ok) {
+    let message = `${response.status} from ${path}`;
+    try {
+      const body = await response.json();
+      if (body?.error) message = body.error;
+    } catch {
+      // keep the status message
+    }
+    throw new Error(message);
+  }
   return response.json();
 }
 
@@ -97,7 +154,28 @@ function renderDevices(devices) {
       select.value = '';
     }
   });
+  configuredHosts = new Set(devices.map((device) => device.host));
+  configuredDevices = devices;
   renderNow(devices);
+  updateMoodGlow();
+}
+
+function moodVars(mood, colorByMood) {
+  if (!colorByMood || !mood || mood === 'unknown') return {};
+  return {
+    '--mood-color': moodColor(mood),
+    '--mood-border': moodRgba(mood, 0.24),
+    '--mood-soft': moodRgba(mood, 0.1),
+    '--mood-glow': moodRgba(mood, 0.85),
+  };
+}
+
+function applyMoodVars(card, mood, colorByMood) {
+  const vars = moodVars(mood, colorByMood);
+  for (const name of MOOD_VARS) {
+    if (vars[name]) card.style.setProperty(name, vars[name]);
+    else card.style.removeProperty(name);
+  }
 }
 
 function nowCard(device) {
@@ -107,10 +185,13 @@ function nowCard(device) {
   const title = current?.track?.title || (device.online ? 'Nothing reported' : 'Device offline');
   const artist = current?.track?.artist || (device.online ? `Source: ${current?.source ?? 'unknown'}` : (device.lastError || 'waiting for poll'));
   const progress = progressFor(current);
+  const showProgress = playing || current?.status === 'pause';
   const mood = current?.mood ?? null;
-  const barColor = playing && mood ? `background:${esc(moodColor(mood))};` : '';
-  return { playing, status, title, artist, progress, mood,
-    html: `<article class="now-card ${playing ? 'playing' : ''}">
+  const moodVar = Object.entries(moodVars(mood, playing))
+    .map(([name, value]) => `${name}:${esc(value)};`)
+    .join('');
+  return { playing, status, title, artist, progress, showProgress, mood,
+    html: `<article class="now-card ${playing ? 'playing' : ''}" style="${moodVar}">
       <div class="now-top">
         <span class="device-name">${esc(device.name)}</span>
         <span class="state-pill ${playing ? 'playing' : ''}">${esc(status)}</span>
@@ -122,7 +203,7 @@ function nowCard(device) {
           <div class="now-artist" title="${esc(artist)}">${esc(artist)}</div>
         </div>
       </div>
-      <div class="progress"><span style="width:${progress.toFixed(1)}%;${barColor}"></span></div>
+      <div class="progress"><span ${showProgress ? '' : 'hidden'} style="width:${progress.toFixed(1)}%"></span></div>
     </article>` };
 }
 
@@ -132,11 +213,31 @@ function progressFor(current) {
   return length > 0 ? Math.min(100, (position / length) * 100) : 0;
 }
 
+// Spread device cards across as few rows as possible (max 3 per row), with
+// each row sharing the width evenly. Every card gets its flex basis so rows
+// with fewer cards still fill the full width.
+function layoutNowGrid(grid) {
+  const cards = [...grid.querySelectorAll('.now-card')];
+  const count = cards.length;
+  if (!count) return;
+  const rows = Math.ceil(count / 3);
+  const perRow = Math.floor(count / rows);
+  const extra = count % rows;
+  let index = 0;
+  for (let row = 0; row < rows; row += 1) {
+    const cols = perRow + (row < extra ? 1 : 0);
+    const basis = cols === 1 ? '100%' : `calc((100% - ${(cols - 1) * 12}px) / ${cols})`;
+    for (let i = 0; i < cols && index < count; i += 1, index += 1) {
+      cards[index].style.setProperty('--card-basis', basis);
+    }
+  }
+}
+
 function renderNow(devices) {
   const grid = $('#now-grid');
   if (!devices.length) {
     paint('now-empty', true, () => {
-      grid.innerHTML = empty('No devices configured. Add one in config.json to start recording.');
+      grid.innerHTML = empty('No devices configured. Use Devices to add one.');
     });
     return;
   }
@@ -147,34 +248,81 @@ function renderNow(devices) {
   const cards = new Map([...grid.querySelectorAll('.now-card')].map((el) => [el.dataset.deviceId, el]));
   devices.forEach((device, index) => {
     const view = nowCard(device);
+    const trackId = device.current?.trackId ?? '';
+    const trackChanged = lastTrackIds.has(device.id) && lastTrackIds.get(device.id) !== trackId;
+    lastTrackIds.set(device.id, trackId);
     // The mutable part of a card is just the progress width. Everything else
     // (especially covers) is kept alive unless the underlying info changed.
+    // Playing state, status pill and mood are patched in place so their colors
+    // can transition instead of the whole card being rebuilt.
     const signature = JSON.stringify({
-      name: device.name, playing: view.playing, status: view.status,
-      title: view.title, artist: view.artist, trackId: device.current?.trackId,
-      mood: view.mood, hasArt: device.current?.hasArt, online: device.online,
-      source: device.current?.source, lastError: device.lastError,
+      name: device.name, title: view.title, artist: view.artist,
+      trackId: device.current?.trackId, hasArt: device.current?.hasArt,
+      online: device.online, source: device.current?.source,
+      lastError: device.lastError,
     });
     let card = cards.get(device.id);
+    let rebuilt = false;
     if (!card || card.dataset.signature !== signature) {
       const template = document.createElement('template');
       template.innerHTML = view.html;
       const fresh = template.content.firstElementChild;
       fresh.dataset.deviceId = device.id;
       fresh.dataset.signature = signature;
-      if (card) grid.replaceChild(fresh, card);
-      else grid.appendChild(fresh);
+      if (card) {
+        // A track change rebuilds the card. Carry the old mood colors into the
+        // new element so the next paint can fade them to the new mood.
+        for (const name of MOOD_VARS) {
+          const previous = card.style.getPropertyValue(name);
+          if (previous) fresh.style.setProperty(name, previous);
+        }
+        grid.replaceChild(fresh, card);
+        rebuilt = true;
+      } else grid.appendChild(fresh);
       card = fresh;
     }
-    const bar = card.querySelector('.progress span');
-    const width = `${view.progress.toFixed(1)}%`;
-    if (bar.style.width !== width) bar.style.width = width;
+    card.classList.toggle('playing', view.playing);
+    const pill = card.querySelector('.state-pill');
+    pill.classList.toggle('playing', view.playing);
+    if (pill.textContent !== view.status) pill.textContent = view.status;
+    const token = (moodTokens.get(device.id) ?? 0) + 1;
+    moodTokens.set(device.id, token);
+    if (rebuilt) {
+      // Commit the carried-over colors first, then switch to the new mood so
+      // the transition animates instead of snapping on a rebuilt card.
+      void card.offsetWidth;
+      requestAnimationFrame(() => {
+        if (moodTokens.get(device.id) === token && card.isConnected) {
+          applyMoodVars(card, view.mood, view.playing);
+        }
+      });
+    } else {
+      applyMoodVars(card, view.mood, view.playing);
+    }
+    const progressEl = card.querySelector('.progress');
+    const bar = progressEl.querySelector('span');
+    bar.hidden = !view.showProgress;
+    const width = trackChanged ? '0%' : `${view.progress.toFixed(1)}%`;
+    if (trackChanged) {
+      // Snap to zero on a new track instead of animating from the old one.
+      bar.style.transition = 'none';
+      bar.style.width = '0%';
+      void bar.offsetWidth;
+      bar.style.transition = '';
+    } else if (bar.style.width !== width) {
+      bar.style.width = width;
+    }
     const targetIndex = [...grid.children].indexOf(card);
     if (targetIndex !== index) grid.insertBefore(card, grid.children[index] || null);
   });
   for (const [id, card] of cards) {
-    if (!devices.some((device) => device.id === id)) card.remove();
+    if (!devices.some((device) => device.id === id)) {
+      card.remove();
+      lastTrackIds.delete(id);
+      moodTokens.delete(id);
+    }
   }
+  layoutNowGrid(grid);
 }
 
 function renderKpis(data) {
@@ -183,38 +331,26 @@ function renderKpis(data) {
   $('#kpi-tracks').textContent = number(totals.uniqueTracks);
   $('#kpi-time').textContent = duration(totals.playedMs);
   $('#kpi-days').textContent = `${number(totals.activeDays)} active day${totals.activeDays === 1 ? '' : 's'}`;
-
-  const ranked = (data.moods ?? [])
-    .filter((row) => row.mood && row.mood !== 'unknown')
-    .sort((a, b) => b.plays - a.plays);
-  const top = ranked[0];
-  const total = ranked.reduce((sum, row) => sum + row.plays, 0);
-  $('#kpi-mood').textContent = top ? moodLabel(top.mood) : '—';
-  $('#kpi-mood-sub').textContent = top
-    ? `${top.plays} plays · ${Math.round((top.plays / total) * 100)}% of tagged plays`
-    : 'add metadata keys to enable moods';
 }
 
 function renderTracks(tracks) {
   const target = $('#top-tracks');
-  $('#tracks-hint').textContent = `${number(tracks.length)} tracks`;
   if (!tracks.length) {
     target.innerHTML = empty('No plays yet. Start playing music on a WiiM device.');
     return;
   }
   const max = Math.max(1, ...tracks.map((track) => track.plays));
-  target.innerHTML = tracks.map((track, index) => {
+  target.innerHTML = tracks.map((track) => {
     const width = Math.max(3, (track.plays / max) * 100);
     const subtitle = track.artist || 'Unknown artist';
     return `<li class="rank-item">
-      <span class="rank">${index + 1}</span>
       ${cover(track.id, track.hasArt, 'cover-rank')}
       <div class="rank-main">
         <div class="rank-title" title="${esc(track.title)}">${esc(track.title || 'Unknown track')}</div>
         <div class="rank-sub">${esc(subtitle)}</div>
       </div>
       <div class="bar"><span style="width:${width.toFixed(1)}%"></span></div>
-      <div class="rank-value"><strong>${number(track.plays)}</strong><span>plays</span></div>
+      <div class="rank-value"><strong>${number(track.plays)}</strong></div>
     </li>`;
   }).join('');
 }
@@ -230,11 +366,12 @@ function renderMoods(moods) {
   }
   const total = known.reduce((sum, row) => sum + row.plays, 0);
   const max = Math.max(1, ...known.map((row) => row.plays));
+  const active = playingMoods();
   target.innerHTML = known.map((row) => {
     const percent = total ? (row.plays / total) * 100 : 0;
     const width = Math.max(3, (row.plays / max) * 100);
-    return `<div class="mood-row">
-      <span class="mood-name"><i class="mood-dot" style="background:${esc(moodColor(row.mood))}"></i>${esc(moodLabel(row.mood))}</span>
+    return `<div class="mood-row ${active.has(row.mood) ? 'playing' : ''}" data-mood="${esc(row.mood)}" style="--bar-glow:${esc(moodRgba(row.mood, 0.85))}">
+      <span class="mood-name">${esc(moodLabel(row.mood))}</span>
       <span class="bar"><span style="width:${width.toFixed(1)}%;background:${esc(moodColor(row.mood))}"></span></span>
       <span class="mood-value">${Math.round(percent)}%</span>
     </div>`;
@@ -248,9 +385,28 @@ function renderArtists(artists) {
     return;
   }
   target.innerHTML = artists.map((artist) => `<div class="artist">
-    <strong title="${esc(artist.artist)}">${esc(artist.artist)}</strong>
-    <span>${number(artist.plays)} plays · ${number(artist.tracks)} tracks</span>
+    ${artistCover(artist.artist)}
+    <div class="artist-copy">
+      <strong title="${esc(artist.artist)}">${esc(artist.artist)}</strong>
+      <span>${number(artist.plays)} plays · ${number(artist.tracks)} tracks</span>
+    </div>
   </div>`).join('');
+}
+
+function demoTimeline() {
+  const plays = [12, 18, 9, 24, 31, 14, 20, 7, 16, 28, 35, 22, 11, 19, 26, 13, 30, 38, 17, 25, 21];
+  const moods = [
+    'calm', 'happy', 'energetic', 'focused', 'calm', 'nostalgic', 'happy',
+    'sad', 'calm', 'energetic', 'dreamy', 'happy', 'focused', 'calm',
+    'romantic', 'energetic', 'nostalgic', 'happy', 'aggressive', 'calm', 'focused',
+  ];
+  const today = new Date();
+  return plays.map((count, index) => ({
+    day: new Date(today.getTime() - (plays.length - 1 - index) * 86400000).toISOString().slice(0, 10),
+    plays: count,
+    playedMs: count * 4 * 60_000,
+    mood: moods[index],
+  }));
 }
 
 function renderTimeline(timeline) {
@@ -263,16 +419,19 @@ function renderTimeline(timeline) {
   const max = Math.max(1, ...items.map((item) => item.plays));
   target.innerHTML = items.map((item) => {
     const height = Math.max(5, (item.plays / max) * 100);
-    return `<div class="timeline-bar" title="${esc(item.day)}: ${item.plays} plays">
-      <i style="height:${height.toFixed(1)}%"></i>
-      <span>${esc(String(item.day).slice(5))}</span>
+    const mood = item.mood && item.mood !== 'unknown' ? item.mood : null;
+    const color = mood ? moodColor(mood) : 'var(--accent)';
+    const label = mood ? ` · ${moodLabel(mood)}` : '';
+    return `<div class="timeline-bar" title="${esc(item.day)}: ${item.plays} plays${esc(label)}">
+      <b class="timeline-count">${number(item.plays)}</b>
+      <i class="activity-fill" style="height:${height.toFixed(1)}%;background:${esc(color)}"></i>
+      <span class="timeline-date">${esc(String(item.day).slice(5))}</span>
     </div>`;
   }).join('');
 }
 
 function renderPlays(plays) {
   const target = $('#recent-plays');
-  $('#plays-hint').textContent = `${number(plays.length)} most recent`;
   if (!plays.length) {
     paint('plays-empty', true, () => {
       target.innerHTML = `<tr><td colspan="5">${empty('No plays in this period.')}</td></tr>`;
@@ -345,9 +504,133 @@ async function refresh() {
     paint('moods', (data.moods ?? []).map((m) => [m.mood, m.plays]),
       () => renderMoods(data.moods ?? []));
     paint('artists', data.topArtists, () => renderArtists(data.topArtists ?? []));
-    paint('timeline', data.timeline, () => renderTimeline(data.timeline ?? []));
+    const timeline = demoMode ? demoTimeline() : data.timeline ?? [];
+    paint('timeline', timeline, () => renderTimeline(timeline));
   }
   if (plays.status === 'fulfilled') renderPlays(plays.value.plays ?? []);
+}
+
+function discoveryStatus(message) {
+  $('#discover-status').textContent = message;
+}
+
+function renderDiscovery(discovered = discoveredDevices) {
+  discoveredDevices = discovered;
+  const target = $('#discover-results');
+  const byHost = new Map();
+  for (const device of configuredDevices) {
+    byHost.set(device.host, { ...device, configured: true });
+  }
+  for (const device of discovered) {
+    const existing = byHost.get(device.host);
+    byHost.set(device.host, {
+      ...existing,
+      ...device,
+      name: device.name || existing?.name || device.host,
+      configured: configuredHosts.has(device.host) || Boolean(existing?.configured),
+    });
+  }
+  const rows = [...byHost.values()].sort((a, b) =>
+    Number(b.configured) - Number(a.configured)
+    || a.host.localeCompare(b.host, undefined, { numeric: true }));
+  if (!rows.length) {
+    target.innerHTML = '<div class="discover-empty">No WiiM devices found. Press Scan to look for them.</div>';
+    return;
+  }
+  target.innerHTML = rows.map((device) => {
+    const { host, configured } = device;
+    const name = device.name || host;
+    const detail = device.model ? `${host} · ${device.model}` : host;
+    const action = configured
+      ? `<button type="button" class="discover-remove" data-host="${esc(host)}" data-name="${esc(name)}">Remove</button>`
+      : `<button type="button" class="discover-add" data-host="${esc(host)}" data-name="${esc(name)}">Add</button>`;
+    return `<div class="discover-row">
+      <div class="discover-copy"><strong>${esc(name)}</strong><span>${esc(detail)}</span></div>
+      ${action}
+    </div>`;
+  }).join('');
+}
+
+async function openDiscovery() {
+  const dialog = $('#discover-dialog');
+  if (!dialog.open) dialog.showModal();
+  renderDiscovery();
+  discoveryStatus('Press Scan to look for WiiM devices on your network.');
+  try {
+    const result = await api('/api/devices');
+    configuredHosts = new Set((result.devices ?? []).map((device) => device.host));
+    configuredDevices = result.devices ?? [];
+    renderDiscovery();
+  } catch {
+    // Keep whatever rows are already visible.
+  }
+}
+
+async function runDiscovery() {
+  const scan = $('#discover-scan');
+  const dialog = $('#discover-dialog');
+  if (!dialog.open) dialog.showModal();
+  $('#scan-spinner').hidden = false;
+  if (configuredDevices.length) {
+    renderDiscovery();
+    discoveryStatus('Devices already added are shown below. Scanning for more…');
+  } else {
+    discoveryStatus('Scanning the local network… this can take a few seconds.');
+  }
+  scan.disabled = true;
+  scan.textContent = 'Scanning…';
+  try {
+    const result = await api('/api/discover');
+    configuredHosts = new Set(result.configured ?? [...configuredHosts]);
+    const devices = result.devices ?? [];
+    renderDiscovery(devices);
+    discoveryStatus(`Found ${devices.length} device${devices.length === 1 ? '' : 's'}. Add the ones you want to track.`);
+  } catch (error) {
+    discoveryStatus(`Discovery failed: ${error.message}`);
+  } finally {
+    $('#scan-spinner').hidden = true;
+    scan.disabled = false;
+    scan.textContent = 'Scan';
+  }
+}
+
+async function addDiscoveredDevice(button) {
+  const { host, name } = button.dataset;
+  button.disabled = true;
+  button.textContent = 'Adding…';
+  try {
+    const result = await api('/api/devices', {
+      method: 'POST',
+      body: JSON.stringify({ host, name }),
+    });
+    configuredHosts.add(host);
+    configuredDevices = [...configuredDevices, { host, name: result.device?.name || name }];
+    renderDiscovery();
+    discoveryStatus(`${name || host} is now being tracked.`);
+    await refresh();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = 'Add';
+    discoveryStatus(`Could not add ${host}: ${error.message}`);
+  }
+}
+
+async function removeDevice(host, name) {
+  try {
+    await api('/api/devices', {
+      method: 'DELETE',
+      body: JSON.stringify({ host }),
+    });
+    configuredHosts.delete(host);
+    configuredDevices = configuredDevices.filter((device) => device.host !== host);
+    renderDiscovery();
+    discoveryStatus(`${name || host} removed. Past listening history is kept.`);
+    await refresh();
+    $('#footer-status').textContent = `${name || host} removed from tracking`;
+  } catch (error) {
+    discoveryStatus(`Could not remove ${host}: ${error.message}`);
+    $('#footer-status').textContent = `Could not remove ${name || host}: ${error.message}`;
+  }
 }
 
 function bind() {
@@ -364,6 +647,17 @@ function bind() {
     state.device = event.target.value;
     void refresh();
   });
+  $('#discover-button').addEventListener('click', () => void openDiscovery());
+  $('#discover-scan').addEventListener('click', () => void runDiscovery());
+  $('#discover-results').addEventListener('click', (event) => {
+    const add = event.target.closest('.discover-add');
+    if (add && !add.disabled) {
+      void addDiscoveredDevice(add);
+      return;
+    }
+    const remove = event.target.closest('.discover-remove');
+    if (remove) void removeDevice(remove.dataset.host, remove.dataset.name);
+  });
 }
 
 async function init() {
@@ -373,6 +667,7 @@ async function init() {
   } catch {
     // UI still works with fallback mood labels.
   }
+  if (demoMode) $('#activity-hint').textContent = 'example data';
   bind();
   await refresh();
   setInterval(() => void refresh(), 15_000);

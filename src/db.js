@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fingerprint } from './util.js';
+import { fingerprint, normalizeText } from './util.js';
+
+export const MERGE_GAP_MS = 10 * 60 * 1000;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -63,6 +65,13 @@ CREATE TABLE IF NOT EXISTS track_mood (
   track_id TEXT PRIMARY KEY REFERENCES tracks(id),
   mood TEXT,
   scores TEXT,
+  fetched_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artist_images (
+  artist_key TEXT PRIMARY KEY,
+  artist TEXT NOT NULL,
+  image_url TEXT,
   fetched_at INTEGER NOT NULL
 );
 `;
@@ -222,6 +231,7 @@ export function upsertTrackTags(db, trackId, tags, source, fetchedAt = Date.now(
     db.prepare('DELETE FROM track_tags WHERE track_id = ? AND source = ?').run(trackId, source);
     const insert = db.prepare(`
       INSERT INTO track_tags (track_id, source, tag, weight, fetched_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(track_id, source, tag) DO UPDATE SET weight = excluded.weight, fetched_at = excluded.fetched_at
     `);
     for (const tag of tags) {
       insert.run(trackId, source, tag.name, Math.max(1, Math.round(tag.weight ?? 1)), fetchedAt);
@@ -238,6 +248,30 @@ export function setTrackMood(db, trackId, mood, scores, fetchedAt = Date.now()) 
     INSERT INTO track_mood (track_id, mood, scores, fetched_at) VALUES (?, ?, ?, ?)
     ON CONFLICT(track_id) DO UPDATE SET mood = excluded.mood, scores = excluded.scores, fetched_at = excluded.fetched_at
   `).run(trackId, mood, JSON.stringify(scores ?? {}), fetchedAt);
+}
+
+export function artistKey(artist) {
+  return normalizeText(artist) || 'unknown';
+}
+
+export function getArtistImage(db, artist) {
+  return db.prepare('SELECT * FROM artist_images WHERE artist_key = ?').get(artistKey(artist)) ?? null;
+}
+
+export function setArtistImage(db, artist, imageUrl, fetchedAt = Date.now()) {
+  db.prepare(`
+    INSERT INTO artist_images (artist_key, artist, image_url, fetched_at)
+    VALUES (@key, @artist, @imageUrl, @fetchedAt)
+    ON CONFLICT(artist_key) DO UPDATE SET
+      artist = excluded.artist,
+      image_url = excluded.image_url,
+      fetched_at = excluded.fetched_at
+  `).run({
+    key: artistKey(artist),
+    artist: String(artist ?? 'Unknown'),
+    imageUrl: imageUrl ?? null,
+    fetchedAt,
+  });
 }
 
 export function getRecentPlays(db, { from = 0, to = Date.now(), deviceId = null, limit = 50 } = {}) {
@@ -269,7 +303,7 @@ export function getRecentPlays(db, { from = 0, to = Date.now(), deviceId = null,
  * a transient device status when the playback position kept moving forward.
  * A position rewind (a genuine repeat) is never merged.
  */
-export function mergeDuplicatePlays(db, { maxGapMs = 15_000, rewindMs = 10_000 } = {}) {
+export function mergeDuplicatePlays(db, { maxGapMs = MERGE_GAP_MS, rewindMs = 10_000 } = {}) {
   const rows = db.prepare(`
     SELECT id, device_id, track_id, source, started_at, ended_at,
            played_ms, position_start_ms, position_end_ms

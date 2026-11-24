@@ -3,13 +3,14 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createArtService } from './art.js';
-import { loadConfig } from './config.js';
+import { loadConfig, saveConfig } from './config.js';
 import { endPlay, getRecentPlays, mergeDuplicatePlays, openDb, removeShortPlays } from './db.js';
+import { discoverWiimDevices, parseSubnet } from './discover.js';
 import { Enricher } from './enrichment.js';
 import { getMeta, getSummary, getTrackDetails, rangeBounds } from './stats.js';
 import { PlayTracker } from './play-detector.js';
 import { Poller } from './poller.js';
-import { clamp } from './util.js';
+import { clamp, deviceIdForHost } from './util.js';
 
 const webDir = fileURLToPath(new URL('./web/', import.meta.url));
 const startedAt = Date.now();
@@ -37,6 +38,21 @@ function parseQuery(req) {
   return new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 }
 
+async function readJson(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 16 * 1024) throw new Error('Request body too large');
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  } catch {
+    throw new Error('Invalid JSON body');
+  }
+}
+
 function serveStatic(res, pathname) {
   const requested = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
   const filePath = path.resolve(webDir, requested);
@@ -57,10 +73,14 @@ function serveStatic(res, pathname) {
   fs.createReadStream(target).pipe(res);
 }
 
-function sendArt(res, art, trackId) {
-  void art
-    .get(trackId)
-    .then(({ buffer, contentType, cached, stale }) => {
+function sendArt(res, load, errorMessage) {
+  void load()
+    .then((image) => {
+      if (!image) {
+        sendJson(res, 404, { error: errorMessage });
+        return;
+      }
+      const { buffer, contentType, cached, stale } = image;
       if (res.headersSent) return;
       res.writeHead(200, {
         'Content-Type': contentType,
@@ -72,7 +92,7 @@ function sendArt(res, art, trackId) {
     })
     .catch(() => {
       if (res.headersSent) return;
-      sendJson(res, 404, { error: 'Cover unavailable' });
+      sendJson(res, 404, { error: errorMessage });
     });
 }
 
@@ -94,7 +114,7 @@ function main() {
   });
   const poller = new Poller({ config, db, tracker });
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     const url = parseQuery(req);
     const route = url.pathname;
 
@@ -111,8 +131,67 @@ function main() {
         return;
       }
 
+      if (route === '/api/devices' && req.method === 'POST') {
+        const body = await readJson(req);
+        const host = String(body.host ?? '')
+          .trim()
+          .replace(/^https?:\/\//, '')
+          .replace(/\/$/, '');
+        if (!host || !/^[\w.-]{1,128}$/.test(host)) {
+          sendJson(res, 400, { error: 'Invalid device host' });
+          return;
+        }
+        const existing = config.devices.find((device) => device.host === host);
+        if (existing) {
+          sendJson(res, 200, { added: false, device: existing });
+          return;
+        }
+        const device = {
+          id: deviceIdForHost(host),
+          name: String(body.name ?? '').trim() || host,
+          host,
+        };
+        poller.addDevice(device);
+        saveConfig(config);
+        console.log(`[devices] added ${device.name} (${device.host})`);
+        sendJson(res, 201, { added: true, device });
+        return;
+      }
+
+      if (route === '/api/devices' && req.method === 'DELETE') {
+        const body = await readJson(req);
+        const host = String(body.host ?? url.searchParams.get('host') ?? '').trim();
+        const device = poller.removeDevice(host);
+        if (!device) {
+          sendJson(res, 404, { error: 'Device is not configured' });
+          return;
+        }
+        saveConfig(config);
+        console.log(`[devices] removed ${device.name} (${device.host})`);
+        sendJson(res, 200, { removed: true, device });
+        return;
+      }
+
       if (route === '/api/devices') {
         sendJson(res, 200, { devices: poller.status() });
+        return;
+      }
+
+      if (route === '/api/discover') {
+        const subnet = url.searchParams.get('subnet');
+        if (subnet && !parseSubnet(subnet)) {
+          sendJson(res, 400, { error: 'Invalid subnet; use a /24 network' });
+          return;
+        }
+        const devices = await discoverWiimDevices({
+          subnets: subnet ? [subnet] : undefined,
+          timeoutMs: 2000,
+          requestTimeoutMs: 800,
+        });
+        sendJson(res, 200, {
+          devices,
+          configured: config.devices.map((device) => device.host),
+        });
         return;
       }
 
@@ -160,7 +239,22 @@ function main() {
           sendJson(res, 400, { error: 'Invalid track id' });
           return;
         }
-        sendArt(res, art, id);
+        sendArt(res, () => art.get(id), 'Cover unavailable');
+        return;
+      }
+
+      if (route.startsWith('/api/artist-art/')) {
+        let artist;
+        try {
+          artist = decodeURIComponent(route.slice('/api/artist-art/'.length));
+        } catch {
+          artist = '';
+        }
+        if (!artist || artist.length > 128) {
+          sendJson(res, 400, { error: 'Invalid artist name' });
+          return;
+        }
+        sendArt(res, () => art.getArtist(artist), 'Artist image unavailable');
         return;
       }
 

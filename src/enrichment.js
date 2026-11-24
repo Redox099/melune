@@ -12,14 +12,17 @@ async function externalJson(url, init = {}) {
 
 function tagList(value, source = 'lastfm') {
   const tags = Array.isArray(value) ? value : value ? [value] : [];
-  return tags
-    .map((tag) => ({
-      name: String(tag?.name ?? '').trim(),
-      weight: Math.max(1, Number(tag?.count) || 1),
-      source,
-    }))
-    .filter((tag) => tag.name)
-    .slice(0, 12);
+  const byName = new Map();
+  for (const tag of tags) {
+    const name = String(tag?.name ?? '').trim();
+    if (!name) continue;
+    const weight = Math.max(1, Number(tag?.count) || 1);
+    const key = name.toLowerCase();
+    const existing = byName.get(key);
+    if (existing) existing.weight = Math.max(existing.weight, weight);
+    else byName.set(key, { name, weight, source });
+  }
+  return [...byName.values()].slice(0, 12);
 }
 
 /**

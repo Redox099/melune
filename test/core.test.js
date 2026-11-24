@@ -5,22 +5,42 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { createArtService, detectImageType } from '../src/art.js';
+import { hostsFor, parseSubnet } from '../src/discover.js';
 import {
   endPlay,
+  getArtistImage,
+  getOpenPlay,
   getOrCreateTrack,
   mergeDuplicatePlays,
   openDb,
   removeShortPlays,
+  setTrackMood,
   startPlay,
   updatePlayTick,
   upsertDevice,
+  upsertTrackTags,
 } from '../src/db.js';
 import { Enricher } from '../src/enrichment.js';
 import { scoreMood } from '../src/mood.js';
 import { PlayTracker } from '../src/play-detector.js';
+import { Poller } from '../src/poller.js';
 import { getSummary, rangeBounds } from '../src/stats.js';
 import { cleanMeta, decodeMaybeHex, deviceIdForHost, fingerprint } from '../src/util.js';
 import { normalizeObservation, sourceName } from '../src/wiim.js';
+
+test('subnet helpers expand a LAN range', () => {
+  assert.deepEqual(parseSubnet('192.168.2.0/24'), {
+    base: '192.168.2.0',
+    baseInt: 0xc0a80200,
+    prefix: 24,
+  });
+  assert.deepEqual(parseSubnet('192.168.2'), parseSubnet('192.168.2.135'));
+
+  const hosts = hostsFor('192.168.2.0/24');
+  assert.equal(hosts.length, 254);
+  assert.equal(hosts[0], '192.168.2.1');
+  assert.equal(hosts.at(-1), '192.168.2.254');
+});
 
 test('hex metadata is decoded only when it round-trips', () => {
   assert.equal(decodeMaybeHex('4D6F726E696E67204C69676874'), 'Morning Light');
@@ -65,6 +85,16 @@ test('WiiM status is normalized with hex metadata and source names', () => {
   assert.equal(sourceName(41), 'bluetooth');
 });
 
+test('vendor refines service names for network playback', () => {
+  assert.equal(sourceName(10, 'Tidal'), 'tidal');
+  assert.equal(sourceName(10, 'vTuner'), 'radio');
+  assert.equal(sourceName(32, 'Tidal'), 'tidal');
+  assert.equal(sourceName(33, 'Roon'), 'roon');
+  assert.equal(sourceName(40, 'Tidal'), 'aux-in');
+  const observation = normalizeObservation({ status: 'play', mode: '10', vendor: 'vTuner' });
+  assert.equal(observation.source, 'radio');
+});
+
 test('tags map to moods', () => {
   const sad = scoreMood([{ name: 'melancholy', weight: 10 }]);
   assert.equal(sad.mood, 'sad');
@@ -74,6 +104,39 @@ test('tags map to moods', () => {
   assert.equal(calm.mood, 'calm');
 
   assert.equal(scoreMood([]).mood, null);
+});
+
+test('duplicate Last.fm tags are merged before storage', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-tags-'));
+  try {
+    const db = openDb(dir);
+    const enricher = new Enricher(db, { lastfm: { apiKey: 'test' } });
+    enricher.lastfmRequest = async (method) => {
+      if (method !== 'track.getInfo') throw new Error(`unexpected method ${method}`);
+      return {
+        track: {
+          toptags: {
+            tag: [
+              { name: 'Rock', count: 5 },
+              { name: 'rock', count: 9 },
+              { name: 'Metal', count: 2 },
+            ],
+          },
+        },
+      };
+    };
+    const tags = await enricher.lastfmTags({ artist: 'A', title: 'B' });
+    assert.deepEqual(tags, [
+      { name: 'Rock', weight: 9, source: 'lastfm' },
+      { name: 'Metal', weight: 2, source: 'lastfm' },
+    ]);
+    const trackId = getOrCreateTrack(db, { artist: 'A', title: 'B' });
+    upsertTrackTags(db, trackId, tags, 'lastfm');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM track_tags WHERE track_id = ?').get(trackId).n, 2);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('enrichment degrades safely without API keys', () => {
@@ -150,6 +213,68 @@ test('stats aggregate plays from SQLite', () => {
     assert.equal(summary.topArtists[0].artist, 'Artist');
     assert.equal(summary.moods[0].mood, 'unknown');
     assert.equal(rangeBounds('week', at).to - rangeBounds('week', at).from, 7 * 24 * 60 * 60 * 1000);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('timeline reports the dominant mood for each day', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-timeline-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const calm = getOrCreateTrack(db, { title: 'Calm', artist: 'Artist' });
+    const sad = getOrCreateTrack(db, { title: 'Sad', artist: 'Artist' });
+    setTrackMood(db, calm, 'calm', {});
+    setTrackMood(db, sad, 'sad', {});
+    for (const [trackId, at] of [[calm, 1000], [calm, 20_000], [sad, 40_000]]) {
+      const playId = startPlay(db, { deviceId: 'd1', trackId, startedAt: at, source: 'wiim' });
+      updatePlayTick(db, playId, 5000, 5000);
+      endPlay(db, playId, at + 6000, 5000);
+    }
+
+    const summary = getSummary(db, { from: 0, to: 60_000 });
+    assert.equal(summary.timeline.length, 1);
+    assert.equal(summary.timeline[0].plays, 3);
+    assert.equal(summary.timeline[0].mood, 'calm');
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('artist images come from Deezer and are cached locally', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-artist-image-'));
+  try {
+    const db = openDb(dir);
+    const imageUrl = 'https://cdn-images.dzcdn.net/images/artist/abc/500x500.jpg';
+    let metadataCalls = 0;
+    let imageCalls = 0;
+    const service = createArtService(db, dir, {
+      jsonFetcher: async (url) => {
+        metadataCalls += 1;
+        assert.match(url, /api\.deezer\.com\/search\/artist/);
+        return { data: [{ name: 'Artist', picture_xl: imageUrl }] };
+      },
+      fetcher: async (url) => {
+        imageCalls += 1;
+        assert.equal(url, imageUrl);
+        return {
+          buffer: Buffer.from('ffd8ffe000104a4649460001', 'hex'),
+          contentType: 'image/jpeg',
+        };
+      },
+    });
+
+    const first = await service.getArtist('Artist');
+    const second = await service.getArtist('Artist');
+
+    assert.equal(metadataCalls, 1);
+    assert.equal(imageCalls, 1);
+    assert.equal(first.cached, false);
+    assert.equal(second.cached, true);
+    assert.equal(getArtistImage(db, 'Artist').image_url, imageUrl);
     db.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -313,6 +438,36 @@ test('an open play survives a tracker restart', () => {
   }
 });
 
+test('removing a device closes its open play and stops polling it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-remove-'));
+  try {
+    const db = openDb(dir);
+    const device = { id: deviceIdForHost('192.168.1.60'), name: 'Office', host: '192.168.1.60' };
+    const other = { id: deviceIdForHost('192.168.1.61'), name: 'Room', host: '192.168.1.61' };
+    upsertDevice(db, device, {}, 1000);
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
+    tracker.observe(device.id, {
+      at: 1000, status: 'play', source: 'wiim', positionMs: 0,
+      track: { title: 'One', artist: 'Artist' },
+    });
+    const poller = new Poller({
+      config: { devices: [device, other], pollIntervalMs: 5000, requestTimeoutMs: 100 },
+      db,
+      tracker,
+    });
+
+    assert.ok(getOpenPlay(db, device.id));
+    assert.equal(poller.removeDevice(device.host)?.host, device.host);
+    assert.equal(poller.removeDevice(device.host), null);
+    assert.equal(getOpenPlay(db, device.id), null);
+    assert.equal(tracker.getState(device.id).openPlays, null);
+    assert.deepEqual(poller.config.devices.map((entry) => entry.host), [other.host]);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('stored duplicate segments are merged on cleanup', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-merge-'));
   try {
@@ -336,6 +491,35 @@ test('stored duplicate segments are merged on cleanup', () => {
     assert.equal(plays[0].played_ms, 9000);
     assert.equal(plays[0].ended_at, 16_000);
     assert.equal(plays[0].position_end_ms, 13_000);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('play segments split by a poll outage are merged when the position moves forward', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-outage-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const trackId = getOrCreateTrack(db, { title: 'One', artist: 'Artist' });
+    const first = startPlay(db, {
+      deviceId: 'd1', trackId, startedAt: 1000, source: 'wiim', positionStartMs: 3000,
+    });
+    updatePlayTick(db, first, 60_000, 63_000);
+    endPlay(db, first, 61_000, 63_000);
+    const second = startPlay(db, {
+      deviceId: 'd1', trackId, startedAt: 301_000, source: 'wiim', positionStartMs: 303_000,
+    });
+    updatePlayTick(db, second, 30_000, 333_000);
+    endPlay(db, second, 332_000, 333_000);
+
+    assert.equal(mergeDuplicatePlays(db), 1);
+    const plays = db.prepare('SELECT * FROM plays').all();
+    assert.equal(plays.length, 1);
+    assert.equal(plays[0].played_ms, 90_000);
+    assert.equal(plays[0].position_start_ms, 3000);
+    assert.equal(plays[0].position_end_ms, 333_000);
     db.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

@@ -39,9 +39,14 @@ export class Poller {
     }
   }
 
+  hasDevice(device) {
+    return this.config.devices.some((configured) => configured.id === device.id);
+  }
+
   async refreshDeviceInfo(device) {
     try {
       const status = await getStatusEx(device.host, { timeoutMs: this.config.requestTimeoutMs });
+      if (!this.hasDevice(device)) return;
       upsertDevice(this.db, device, deviceInfoFromStatus(status));
     } catch {
       // Device info is cosmetic; offline devices are reported by the normal poll.
@@ -51,12 +56,14 @@ export class Poller {
   async pollDevice(device) {
     try {
       const observation = await fetchObservation(device, { timeoutMs: this.config.requestTimeoutMs });
+      if (!this.hasDevice(device)) return;
       upsertDevice(this.db, device, {}, observation.at);
       markDevicePolled(this.db, device.id, observation.at, null);
       this.current.set(device.id, observation);
       this.errors.delete(device.id);
       this.tracker.observe(device.id, observation);
     } catch (error) {
+      if (!this.hasDevice(device)) return;
       markDevicePolled(this.db, device.id, Date.now(), error.message);
       this.errors.set(device.id, error.message);
     }
@@ -64,12 +71,31 @@ export class Poller {
 
   async tick() {
     this.ticks += 1;
-    for (const device of this.config.devices) {
+    for (const device of [...this.config.devices]) {
+      if (!this.hasDevice(device)) continue;
       await this.pollDevice(device);
     }
     // The tracker merges most split plays live; this also catches brief
     // metadata glitches that briefly look like a new track.
     mergeDuplicatePlays(this.db);
+  }
+
+  addDevice(device) {
+    if (this.config.devices.some((existing) => existing.host === device.host)) return false;
+    this.config.devices.push(device);
+    void this.refreshDeviceInfo(device);
+    void this.pollDevice(device);
+    return true;
+  }
+
+  removeDevice(host) {
+    const index = this.config.devices.findIndex((device) => device.host === host);
+    if (index < 0) return null;
+    const [device] = this.config.devices.splice(index, 1);
+    this.tracker.forget(device.id);
+    this.current.delete(device.id);
+    this.errors.delete(device.id);
+    return device;
   }
 
   getCurrent(deviceId) {

@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { getTrack } from './db.js';
+import { getArtistImage, getTrack, setArtistImage } from './db.js';
+import { normalizeText } from './util.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -64,17 +65,43 @@ async function defaultFetch(url, timeoutMs) {
   }
 }
 
+async function defaultJson(url, timeoutMs) {
+  try {
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: 'follow',
+      headers: { 'User-Agent': 'melune/0.1' },
+    });
+    if (!response.ok) throw new Error(`Artist metadata HTTP ${response.status}`);
+    return response.json();
+  } catch (error) {
+    if (!CONNECT_ERRORS.has(error.code)) throw error;
+    const { stdout } = await execFileAsync(
+      'curl',
+      ['-L', '--silent', '--show-error', '--max-time', String(Math.ceil(timeoutMs / 1000)), url],
+      { timeout: timeoutMs + 1000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8' },
+    );
+    return JSON.parse(stdout);
+  }
+}
+
 /**
- * Fetches album art from the URI WiiM reported, caches it on disk, and serves
- * stale cache copies if the remote host is unavailable.
+ * Fetches images from the URI WiiM reported or from Deezer's public artist
+ * metadata, caches them on disk, and serves stale cache copies if the remote
+ * host is unavailable.
  */
-export function createArtService(db, dataDir, { fetcher = defaultFetch, maxAgeMs = MAX_AGE_MS } = {}) {
+export function createArtService(
+  db,
+  dataDir,
+  { fetcher = defaultFetch, jsonFetcher = defaultJson, maxAgeMs = MAX_AGE_MS } = {},
+) {
   const cacheDir = path.join(dataDir, 'art');
   fs.mkdirSync(cacheDir, { recursive: true });
   const pending = new Map();
+  const metaPending = new Map();
 
-  function pathsFor(uri) {
-    const key = createHash('sha256').update(uri).digest('hex');
+  function pathsFor(uri, prefix = '') {
+    const key = createHash('sha256').update(`${prefix}${uri}`).digest('hex');
     return {
       key,
       image: path.join(cacheDir, `${key}.img`),
@@ -98,10 +125,8 @@ export function createArtService(db, dataDir, { fetcher = defaultFetch, maxAgeMs
     fs.writeFileSync(paths.type, contentType);
   }
 
-  async function get(trackId) {
-    const track = getTrack(db, trackId);
-    if (!track?.art_uri) return null;
-    const paths = pathsFor(track.art_uri);
+  async function loadImage(uri, prefix = '') {
+    const paths = pathsFor(uri, prefix);
     const cached = readCached(paths);
     if (cached && Date.now() - fs.statSync(paths.image).mtimeMs < maxAgeMs) {
       return { ...cached, cached: true };
@@ -109,7 +134,7 @@ export function createArtService(db, dataDir, { fetcher = defaultFetch, maxAgeMs
 
     let task = pending.get(paths.key);
     if (!task) {
-      task = fetcher(track.art_uri, 6000)
+      task = fetcher(uri, 6000)
         .then(({ buffer, contentType }) => {
           const type = safeContentType(contentType, buffer);
           writeCached(paths, buffer, type);
@@ -125,5 +150,56 @@ export function createArtService(db, dataDir, { fetcher = defaultFetch, maxAgeMs
     return task;
   }
 
-  return { get, cacheDir };
+  async function get(trackId) {
+    const track = getTrack(db, trackId);
+    if (!track?.art_uri) return null;
+    return loadImage(track.art_uri);
+  }
+
+  async function findArtistImageUrl(artist) {
+    const url = new URL('https://api.deezer.com/search/artist');
+    url.search = new URLSearchParams({ q: artist, limit: '5' }).toString();
+    const data = await jsonFetcher(url.toString(), 6000);
+    const rows = Array.isArray(data?.data) ? data.data : [];
+    const wanted = normalizeText(artist);
+    const match = rows.find((row) => normalizeText(row.name) === wanted) ?? rows[0];
+    const candidate =
+      match?.picture_xl || match?.picture_big || match?.picture_medium || match?.picture;
+    if (!/^https:\/\/(?:cdn-images\.dzcdn\.net|api\.deezer\.com)\//.test(candidate ?? '')) {
+      return null;
+    }
+    return candidate;
+  }
+
+  async function getArtist(artist) {
+    const name = String(artist ?? '').trim();
+    if (!name) return null;
+    const key = `${normalizeText(name) || 'unknown'}`;
+    const now = Date.now();
+    let record = getArtistImage(db, name);
+
+    if (!record || now - record.fetched_at > maxAgeMs) {
+      let task = metaPending.get(key);
+      if (!task) {
+        task = findArtistImageUrl(name)
+          .then((imageUrl) => {
+            setArtistImage(db, name, imageUrl, Date.now());
+            return imageUrl;
+          })
+          .catch((error) => {
+            if (record?.image_url) return record.image_url;
+            throw error;
+          })
+          .finally(() => metaPending.delete(key));
+        metaPending.set(key, task);
+      }
+      const imageUrl = await task;
+      record = { ...(record ?? {}), image_url: imageUrl, fetched_at: now };
+    }
+
+    if (!record.image_url) return null;
+    return loadImage(record.image_url, 'artist:');
+  }
+
+  return { get, getArtist, cacheDir };
 }

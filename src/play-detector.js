@@ -1,4 +1,12 @@
-import { finishPlay, getOpenPlay, getOrCreateTrack, reopenPlay, startPlay, updatePlayTick } from './db.js';
+import {
+  MERGE_GAP_MS,
+  finishPlay,
+  getOpenPlay,
+  getOrCreateTrack,
+  reopenPlay,
+  startPlay,
+  updatePlayTick,
+} from './db.js';
 import { fingerprint, nowMs } from './util.js';
 
 const ACTIVE_STATES = new Set(['play', 'loading']);
@@ -23,7 +31,7 @@ export class PlayTracker {
     this.minPlayMs = Math.max(0, minPlayMs);
     this.maxTickMs = Math.max(pollIntervalMs * 2, 15_000);
     this.gapThresholdMs = Math.max(pollIntervalMs * 4, 60_000);
-    this.resumeGapMs = Math.max(pollIntervalMs * 3, 15_000);
+    this.resumeGapMs = MERGE_GAP_MS;
     this.states = new Map();
     this.startedCount = 0;
   }
@@ -165,6 +173,20 @@ export class PlayTracker {
     }
     this.states.set(deviceId, state);
     return { reason, playId: state.playId ?? null, status: observation.status };
+  }
+
+  /** Stop tracking a device and close or discard whatever it was playing. */
+  forget(deviceId) {
+    const state = this.states.get(deviceId);
+    const at = nowMs();
+    const playIds = new Set();
+    if (state?.playId) playIds.add(state.playId);
+    const open = getOpenPlay(this.db, deviceId);
+    if (open) playIds.add(open.id);
+    for (const playId of playIds) {
+      finishPlay(this.db, playId, at, null, this.minPlayMs);
+    }
+    this.states.delete(deviceId);
   }
 
   getState(deviceId) {

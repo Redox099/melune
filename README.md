@@ -6,7 +6,8 @@ I been in lately?"
 
 It polls the WiiM/LinkPlay HTTP API on your LAN, stores discrete play events in
 SQLite, and serves a lightweight dashboard. No cloud account is required for the
-core history — it all stays on the machine running melune.
+core history — it all stays on the machine running melune. Art is cached locally;
+Last.fm is contacted only for tags when configured, Deezer for artist photos.
 
 ## Quick start
 
@@ -30,10 +31,17 @@ If `config.json` is missing, the first `npm start` creates it from
 npm run discover
 ```
 
-This sends an SSDP search and validates responders with `getStatusEx`. Some
-networks block multicast, so if nothing is found, get the IP from the WiiM Home
-app (**Devices → Settings → Network Status**) or your router's DHCP list and
-set it manually.
+This sends an SSDP search, then scans the local `/24` subnet(s) and validates
+responders with `getStatusEx`. If your machine has several networks, pass the
+right one explicitly:
+
+```bash
+npm run discover -- 192.168.2.0/24
+```
+
+If nothing is found, get the IP from the WiiM Home app
+(**Devices → Settings → Network Status**) or your router's DHCP list and set it
+manually.
 
 ## Configuration
 
@@ -73,10 +81,11 @@ tracks play sessions per device:
 - **Pause/resume** keeps the same play open. Listening time only accumulates
   while the player reports `play` or `loading`, so leaving a track paused for an
   hour does not inflate its duration.
-- **Brief stop/start glitches** on the same track are merged back into one play.
-  A real repeat (position jumps back near the start) still counts as a new play.
-  The same cleanup runs on startup and after each poll, so older split plays
-  are repaired automatically.
+- **Brief stop/start glitches, tracker restarts, and poll outages** on the same
+  track are merged back into one play when the reported position keeps moving
+  forward (up to a 10-minute gap). A real repeat (position jumps back near the
+  start) still counts as a new play. The same cleanup runs on startup and after
+  each poll, so older split plays are repaired automatically.
 - **Skipped tracks are discarded.** A play shorter than `minPlayMs` (30s by
   default) is deleted instead of counted. Existing short plays are cleaned up
   on startup, and the threshold can be changed in `config.json`.
@@ -87,7 +96,17 @@ tracks play sessions per device:
 
 The dashboard offers **Today / 7 days / 30 days / All time** ranges and a device
 filter, with most-played tracks, top artists, mood mix, activity timeline, and
-recent plays.
+recent plays. **Devices** scans the LAN and lets you add or remove WiiM
+devices without editing `config.json` or restarting the server. Removing a
+device stops polling immediately but keeps its listening history.
+
+Open <http://127.0.0.1:8787/?demo=1> to preview the Activity card with
+example bars. Demo mode only affects that card; your real data is untouched.
+
+The default dark design is unchanged. Add `?theme=light` to use the light color
+palette, e.g. <http://127.0.0.1:8787/?theme=light> (combine with `&demo=1` if
+needed). Both themes share the same layout and CSS, so future changes apply to
+both automatically.
 
 ## Album covers
 
@@ -96,6 +115,11 @@ under `data/art/`. The dashboard loads covers from the local API, so the browser
 never talks to the CDN and repeated views don't re-download artwork. Cached
 images are refreshed after seven days; if the source is unreachable, the last
 cached copy is still served. Sources without artwork get a small placeholder.
+
+Top artist photos are looked up from Deezer's public artist API and cached the
+same way under `data/art/`. No API key is needed, and artist names are resolved
+once per week. If no matching photo is found, the card shows a placeholder
+instead of an album cover.
 
 ## Mood tags
 
@@ -119,6 +143,9 @@ All endpoints are unauthenticated and intended for localhost use.
 | --- | --- |
 | `GET /api/health` | Uptime, poller state, enrichment counters. |
 | `GET /api/devices` | Devices, online state, last error, and current track. |
+| `GET /api/discover?subnet=192.168.2.0/24` | Scan for WiiM devices. The `subnet` parameter is optional. |
+| `POST /api/devices` | Add `{ "name": "...", "host": "..." }` to config and start polling it. |
+| `DELETE /api/devices` | Stop tracking `{ "host": "..." }` and remove it from config. Past plays are kept. |
 | `GET /api/stats?range=week&device=<id>` | Totals, top tracks/artists, moods, sources, daily timeline. `range` is `today`, `week`, `month`, or `all`. |
 | `GET /api/plays?range=week&device=<id>&limit=50` | Recent play events. |
 | `GET /api/art/:trackId` | Cached album cover image for a track. |
