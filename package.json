@@ -1,0 +1,16 @@
+{
+  "name": "melune",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local listening history for WiiM devices, with charts and mood tags.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "discover": "node src/discover.js",
+    "test": "node --test"
+  }
+}

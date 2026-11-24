@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f6f7f9" />
+  <title>melune — listening history</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">m</div>
+        <div class="brand-copy">
+          <h1>melune</h1>
+          <p>Everything your WiiM has been playing</p>
+        </div>
+      </div>
+      <div class="health" id="health">
+        <span class="health-dot" id="health-dot"></span>
+        <span id="health-text">Connecting…</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="controls" aria-label="Dashboard filters">
+        <div class="tabs" id="range-tabs" role="group" aria-label="Date range">
+          <button type="button" data-range="today">Today</button>
+          <button type="button" data-range="week" class="active">7 days</button>
+          <button type="button" data-range="month">30 days</button>
+          <button type="button" data-range="all">All time</button>
+        </div>
+        <label class="select-wrap">
+          <span>Device</span>
+          <select id="device-select"><option value="">All devices</option></select>
+        </label>
+      </section>
+
+      <section class="section" id="now-section">
+        <div class="section-head"><h2>Now playing</h2></div>
+        <div class="now-grid" id="now-grid"></div>
+      </section>
+
+      <section class="kpis" id="kpis" aria-label="Period summary">
+        <div class="kpi"><span class="kpi-label">Plays</span><strong id="kpi-plays">—</strong><span class="kpi-sub" id="kpi-days"></span></div>
+        <div class="kpi"><span class="kpi-label">Different tracks</span><strong id="kpi-tracks">—</strong><span class="kpi-sub">unique songs</span></div>
+        <div class="kpi"><span class="kpi-label">Time listened</span><strong id="kpi-time">—</strong><span class="kpi-sub">estimated from polls</span></div>
+        <div class="kpi"><span class="kpi-label">Mood</span><strong id="kpi-mood">—</strong><span class="kpi-sub" id="kpi-mood-sub">top mood this period</span></div>
+      </section>
+
+      <div class="columns">
+        <section class="card">
+          <div class="section-head"><h2>Most played tracks</h2><span class="hint" id="tracks-hint"></span></div>
+          <ol class="rank-list" id="top-tracks"></ol>
+        </section>
+        <div class="stack">
+          <section class="card">
+            <div class="section-head"><h2>Mood mix</h2></div>
+            <div class="mood-list" id="moods"></div>
+          </section>
+          <section class="card">
+            <div class="section-head"><h2>Top artists</h2></div>
+            <div class="artist-grid" id="artists"></div>
+          </section>
+        </div>
+      </div>
+
+      <section class="card">
+        <div class="section-head"><h2>Activity</h2><span class="hint">plays per day</span></div>
+        <div class="timeline" id="timeline"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-head"><h2>Recent plays</h2><span class="hint" id="plays-hint"></span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>When</th><th>Track</th><th>Device</th><th>Source</th><th>Listened</th></tr></thead>
+            <tbody id="recent-plays"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Data stays on this machine. Album art is cached locally; Last.fm is only contacted for tags when configured.</span>
+      <span id="footer-status"></span>
+    </footer>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
