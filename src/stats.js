@@ -1,5 +1,5 @@
 import { getTrack } from './db.js';
-import { MOODS, moodColor, trackColor } from './mood.js';
+import { MOODS, moodColor } from './mood.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -129,9 +129,7 @@ export function getSummary(db, options = {}) {
      ORDER BY d.day
   `).all(...params, ...params, ...params).map((row) => ({
     ...row,
-    color: row.mood && row.mood !== 'unknown'
-      ? moodColor(row.mood)
-      : trackColor(row.trackId),
+    color: moodColor(row.mood),
   }));
 
   return {

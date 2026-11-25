@@ -1,5 +1,5 @@
 const state = { range: 'today', device: '', moods: {} };
-const MOOD_FALLBACK = '#94a3b8';
+const MOOD_FALLBACK = '#6b7280';
 let configuredHosts = new Set();
 let configuredDevices = [];
 let discoveredDevices = [];

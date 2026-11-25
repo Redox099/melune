@@ -1,5 +1,5 @@
 import { getDevices, getTrackMood, markDevicePolled, mergeDuplicatePlays, upsertDevice } from './db.js';
-import { moodColor, trackColor } from './mood.js';
+import { moodColor } from './mood.js';
 import { fingerprint } from './util.js';
 import { deviceInfoFromStatus, fetchObservation, getStatusEx } from './wiim.js';
 
@@ -122,7 +122,7 @@ export class Poller {
         ? fingerprint(current.track)
         : null;
       const mood = trackId ? getTrackMood(this.db, trackId) : null;
-      const color = mood ? moodColor(mood) : trackColor(trackId);
+      const color = moodColor(mood);
       return {
         id: device.id,
         name: row?.name || device.name,

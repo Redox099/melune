@@ -21,7 +21,7 @@ import {
   upsertTrackTags,
 } from '../src/db.js';
 import { Enricher } from '../src/enrichment.js';
-import { localMood, scoreMood, trackColor } from '../src/mood.js';
+import { localMood, moodColor, scoreMood } from '../src/mood.js';
 import { PlayTracker } from '../src/play-detector.js';
 import { Poller } from '../src/poller.js';
 import { startServer } from '../src/server.js';
@@ -116,9 +116,9 @@ test('local metadata infers moods without partial word matches', () => {
   assert.equal(localMood({ title: 'Into The Black', album: 'Kill For Love' }).mood, null);
 });
 
-test('track colors are stable', () => {
-  assert.equal(trackColor('abc123'), trackColor('abc123'));
-  assert.match(trackColor('abc123'), /^#[0-9a-f]{6}$/i);
+test('tracks without a mood use neutral gray', () => {
+  assert.equal(moodColor(null), '#6b7280');
+  assert.equal(moodColor('unknown'), '#6b7280');
 });
 
 test('local moods never replace a MusicBrainz mood', () => {

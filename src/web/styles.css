@@ -57,9 +57,9 @@
   --rank-inset: inset 0 1px 0 rgba(0, 0, 0, 0.25);
   --mood-name: #7d8592;
   --mood-value: #e5e7eb;
-  --mood-fallback: #94a3b8;
-  --mood-soft-fallback: rgba(148, 163, 184, 0.12);
-  --mood-glow-fallback: rgba(148, 163, 184, 0.85);
+  --mood-fallback: #6b7280;
+  --mood-soft-fallback: rgba(107, 114, 128, 0.12);
+  --mood-glow-fallback: rgba(107, 114, 128, 0.85);
   --artist-bevel: inset 0 -1px 0 rgba(0, 0, 0, 0.2);
   --artist-top-inset: inset 0 1px 0 rgba(255, 255, 255, 0.1);
   --row-shadow: 0 -2px 0 rgba(0, 0, 0, 0.5);

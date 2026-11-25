@@ -1,5 +1,7 @@
 import { normalizeText } from './util.js';
 
+export const NO_MOOD_COLOR = '#6b7280';
+
 export const MOODS = {
   happy: { label: 'Happy', color: '#d97706' },
   energetic: { label: 'Energetic', color: '#e11d48' },
@@ -65,7 +67,7 @@ export function moodLabel(mood) {
 }
 
 export function moodColor(mood) {
-  return MOODS[mood]?.color ?? '#6b7280';
+  return MOODS[mood]?.color ?? NO_MOOD_COLOR;
 }
 
 // Ordinary words such as "fast" or "sad" are too ambiguous to infer a mood
@@ -111,19 +113,4 @@ export function localMoodTags(track = {}) {
 /** Best-effort local mood inference; no network or API key required. */
 export function localMood(track = {}) {
   return scoreMood(localMoodTags(track), { wordBoundaries: true });
-}
-
-const TRACK_COLORS = [
-  '#0284c7', '#7c3aed', '#db2777', '#059669', '#d97706', '#0d9488',
-  '#6366f1', '#e11d48', '#ea580c', '#2563eb', '#65a30d', '#c026d3',
-];
-
-/** Stable decorative color for tracks that have no mood. */
-export function trackColor(trackId = '') {
-  const text = String(trackId || 'unknown');
-  let hash = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    hash = (Math.imul(hash, 31) + text.charCodeAt(index)) >>> 0;
-  }
-  return TRACK_COLORS[hash % TRACK_COLORS.length];
 }

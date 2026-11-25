@@ -20,8 +20,8 @@ offline fallback.
 - Charts for most-played tracks, top artists, mood mix, daily activity, and
   recent plays.
 - Local album-art cache with stale fallback; weekly Deezer artist photos.
-- MusicBrainz tag-based moods with offline local inference and stable per-track
-  colors. No API key is needed.
+- MusicBrainz tag-based moods with offline local inference. Tracks without a
+  mood use neutral gray. No API key is needed.
 - Device discovery and add/remove from the dashboard, no restart required.
 - One-click **Delete data** that wipes history and cached art but keeps devices.
 
@@ -31,8 +31,8 @@ offline fallback.
 - A WiiM device reachable from this machine on the same LAN.
 - `curl` is optional. It is used only as a fallback when Node's direct HTTPS
   sockets cannot reach a hardened local runtime.
-- Internet access is optional. Without it, local moods and colors still work;
-  MusicBrainz tags and Deezer artist photos are skipped.
+- Internet access is optional. Local moods still work without it; MusicBrainz
+  tags and Deezer artist photos are skipped.
 
 WiiM devices use self-signed HTTPS certificates, so certificate verification is
 disabled for device requests. Only point melune at devices you trust on your own
@@ -116,8 +116,8 @@ It shows:
 - Summary counters: plays, unique tracks, estimated listening time, and active
   days.
 - Top 20 tracks and top 8 artists for the selected range.
-- Mood mix, with colors and labels from the mood legend; untagged tracks still
-  get stable colors in now-playing cards and activity.
+- Mood mix, with colors and labels from the mood legend; untagged tracks use
+  neutral gray in now-playing cards and activity.
 - Daily activity for the last 21 days.
 - The 30 most recent play events, with device, source, and listened duration.
 
@@ -180,8 +180,8 @@ Tags are scored with the keyword rules in `src/mood.js`. Local inference is the
 offline fallback: it only trusts genre-like words and known phrases in
 artist/title/album text, so ordinary words such as `fast` or `sad` do not turn
 **Fast Car** into Energetic. If MusicBrainz produces no usable mood, the local
-guess is kept. Tracks with no evidence at all get a deterministic color from
-their track ID. Most played tracks bars remain neutral.
+guess is kept. Tracks with no mood at all are gray. Most played tracks bars are
+neutral too.
 
 Stored tags are labeled with their source (`musicbrainz` or `local`), and that
 source is available from `GET /api/tracks/:id`. The keyword rules map tags to
@@ -244,8 +244,8 @@ npm test         # run the built-in node:test suite
   `curl`; install `curl` if direct sockets are blocked.
 - **Mood mix is sparse:** MusicBrainz enrichment runs in the background and is
   rate-limited to one request per second, so a large history takes a while.
-  Tracks with no usable tags still get stable colors. Mood data is never
-  required for recording.
+  Tracks with no usable tags are shown in gray. Mood data is never required for
+  recording.
 - **Dashboard is empty:** check the selected range and device filter, and
   remember that plays shorter than `minPlayMs` are discarded by default.
 - **API is reachable from other machines:** that is expected when `host` is
@@ -257,7 +257,7 @@ npm test         # run the built-in node:test suite
   WiiM-reported position, not sample-accurate playback.
 - The UI refreshes on a 15-second interval rather than push updates.
 - Sources without useful metadata, such as AUX, Bluetooth, or some radio
-  streams, produce limited titles and may not map to moods; they still get
-  stable decorative colors.
+  streams, produce limited titles and may not map to moods; they appear in
+  neutral gray.
 - The built-in API is designed for localhost use and has no user accounts or
   permissions.
