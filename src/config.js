@@ -10,7 +10,6 @@ const DEFAULTS = {
   requestTimeoutMs: 2500,
   minPlayMs: 30_000,
   devices: [],
-  lastfm: { apiKey: '' },
 };
 
 const examplePath = () => path.resolve(process.cwd(), 'config.example.json');
@@ -34,11 +33,9 @@ export function loadConfig({ configPath = defaultConfigPath(), createIfMissing =
   const config = {
     ...DEFAULTS,
     ...raw,
-    lastfm: { ...DEFAULTS.lastfm, ...(raw.lastfm ?? {}) },
   };
 
   config.port = Number(process.env.MELUNE_PORT || config.port);
-  config.lastfm.apiKey = process.env.LASTFM_API_KEY || config.lastfm.apiKey;
 
   config.dataDir = path.resolve(process.cwd(), config.dataDir);
   config.devices = (config.devices ?? [])
@@ -65,7 +62,6 @@ export function saveConfig(config, configPath = defaultConfigPath()) {
     requestTimeoutMs: config.requestTimeoutMs,
     minPlayMs: config.minPlayMs,
     devices: (config.devices ?? []).map(({ name, host }) => ({ name, host })),
-    lastfm: { apiKey: config.lastfm?.apiKey ?? '' },
   };
   fs.writeFileSync(configPath, `${JSON.stringify(safe, null, 2)}\n`);
 }

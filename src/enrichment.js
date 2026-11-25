@@ -1,22 +1,24 @@
 import { getOrCreateTrack, getTracksForEnrichment, setTrackMood, upsertTrackTags } from './db.js';
-import { scoreMood } from './mood.js';
+import { localMood, scoreMood } from './mood.js';
 import { fingerprint, sleep } from './util.js';
 
 const RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+const MB_API_ROOT = 'https://musicbrainz.org/ws/2/';
+const MB_USER_AGENT = 'melune/0.1.0 ( https://github.com/redox/melune )';
+// MusicBrainz allows one request per second per source IP. Leave a little room.
+const MB_REQUEST_GAP_MS = 1100;
+const MB_SEARCH_LIMIT = 3;
+const MB_MAX_RETRIES = 3;
+const MB_TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
 
-async function externalJson(url, init = {}) {
-  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(6000) });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
-
-function tagList(value, source = 'lastfm') {
+function tagList(value, source = 'musicbrainz') {
   const tags = Array.isArray(value) ? value : value ? [value] : [];
   const byName = new Map();
   for (const tag of tags) {
     const name = String(tag?.name ?? '').trim();
     if (!name) continue;
-    const weight = Math.max(1, Number(tag?.count) || 1);
+    const rawWeight = tag.weight ?? tag.count;
+    const weight = Math.max(1, Number(rawWeight) || 1);
     const key = name.toLowerCase();
     const existing = byName.get(key);
     if (existing) existing.weight = Math.max(existing.weight, weight);
@@ -25,9 +27,50 @@ function tagList(value, source = 'lastfm') {
   return [...byName.values()].slice(0, 12);
 }
 
+function combinedTags(payload) {
+  return tagList([...(payload?.tags ?? []), ...(payload?.genres ?? [])]);
+}
+
+function phrase(value) {
+  return `"${String(value).replace(/[\\"]/g, '\\$&')}"`;
+}
+
+function searchQuery(fields) {
+  return fields.filter(Boolean).join(' AND ');
+}
+
+function primaryArtist(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  return text.split(/\s*(?:,|;|&|\bfeat\.?\b|\bft\.?\b|\bwith\b)\s*/i)[0].trim() || text;
+}
+
+function artistQueries(artist) {
+  const primary = primaryArtist(artist);
+  const full = String(artist ?? '').trim();
+  return [...new Set([primary, full].filter(Boolean))];
+}
+
+function retryDelayMs(response, attempt) {
+  const header = response?.headers?.get?.('retry-after');
+  if (header) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.max(seconds * 1000, MB_REQUEST_GAP_MS);
+    }
+    const at = Date.parse(header);
+    if (!Number.isNaN(at)) return Math.max(at - Date.now(), MB_REQUEST_GAP_MS);
+  }
+  return MB_REQUEST_GAP_MS * (attempt + 1);
+}
+
+function hasMood(tags) {
+  return Boolean(scoreMood(tags).mood);
+}
+
 /**
- * Optional metadata enrichment from Last.fm tags. Everything is best-effort:
- * playback recording never depends on it.
+ * Metadata enrichment from MusicBrainz tags and genres. Everything is
+ * best-effort: playback recording never depends on it.
  */
 export class Enricher {
   constructor(db, config = {}) {
@@ -36,19 +79,18 @@ export class Enricher {
     this.queue = [];
     this.processing = false;
     this.seen = new Map();
+    this.lastMbRequestAt = 0;
+    this.fetch = fetch;
+    this.sleep = sleep;
     this.stats = { enriched: 0, failed: 0, skipped: 0 };
   }
 
   get configured() {
-    return { lastfm: Boolean(this.config.lastfm?.apiKey) };
+    return { musicbrainz: true };
   }
 
   enqueue(track) {
-    if (!this.configured.lastfm) {
-      this.stats.skipped += 1;
-      return;
-    }
-    if (!track?.title && !track?.artist) {
+    if (!track?.artist && !track?.title && !track?.album) {
       this.stats.skipped += 1;
       return;
     }
@@ -60,9 +102,8 @@ export class Enricher {
     void this.drain();
   }
 
-  /** Queue already-seen tracks so a newly added key also enriches history. */
+  /** Queue already-seen tracks so history is enriched on startup. */
   backfill(limit = 100) {
-    if (!this.configured.lastfm) return 0;
     const tracks = getTracksForEnrichment(this.db, limit);
     for (const track of tracks) this.enqueue(track);
     return tracks.length;
@@ -80,7 +121,7 @@ export class Enricher {
         this.stats.failed += 1;
         console.warn(`[enrich] ${track.title || 'unknown'}: ${error.message}`);
       }
-      await sleep(300);
+      await this.sleep(300);
     }
     this.processing = false;
   }
@@ -89,53 +130,93 @@ export class Enricher {
     const trackId = getOrCreateTrack(this.db, track);
     let tags = [];
     try {
-      tags = await this.lastfmTags(track);
+      tags = await this.mbTags(track);
     } catch (error) {
-      console.warn(`[enrich] Last.fm: ${error.message}`);
+      console.warn(`[enrich] MusicBrainz: ${error.message}`);
     }
-    upsertTrackTags(this.db, trackId, tags, 'lastfm');
-    const { mood, scores } = scoreMood(tags);
-    setTrackMood(this.db, trackId, mood, scores);
+    upsertTrackTags(this.db, trackId, tags, 'musicbrainz');
+    const inferred = scoreMood(tags);
+    const fallback = localMood(track);
+    const mood = inferred.mood ?? fallback.mood;
+    const scores = inferred.mood ? inferred.scores : fallback.scores;
+    setTrackMood(this.db, trackId, mood, scores, {
+      source: inferred.mood ? 'musicbrainz' : 'local',
+    });
     return { mood, scores, tags };
   }
 
-  async lastfmRequest(method, extra = {}) {
-    const url = new URL('https://ws.audioscrobbler.com/2.0/');
-    url.search = new URLSearchParams({
-      method,
-      api_key: this.config.lastfm.apiKey,
-      format: 'json',
-      ...extra,
-    }).toString();
-    return externalJson(url);
+  async mbRequest(path, params = {}, attempt = 0) {
+    const wait = MB_REQUEST_GAP_MS - (Date.now() - this.lastMbRequestAt);
+    if (wait > 0) await this.sleep(wait);
+    const url = new URL(path, MB_API_ROOT);
+    url.search = new URLSearchParams({ fmt: 'json', ...params }).toString();
+    let response;
+    try {
+      response = await this.fetch(url, {
+        headers: { 'User-Agent': MB_USER_AGENT, Accept: 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      });
+      this.lastMbRequestAt = Date.now();
+    } catch (error) {
+      this.lastMbRequestAt = Date.now();
+      if (attempt < MB_MAX_RETRIES) {
+        await this.sleep(MB_REQUEST_GAP_MS * (attempt + 1));
+        return this.mbRequest(path, params, attempt + 1);
+      }
+      throw error;
+    }
+
+    if (MB_TRANSIENT_STATUSES.has(response?.status) && attempt < MB_MAX_RETRIES) {
+      await this.sleep(retryDelayMs(response, attempt));
+      return this.mbRequest(path, params, attempt + 1);
+    }
+    if (!response?.ok) throw new Error(`HTTP ${response?.status ?? 'unknown'}`);
+    return response.json();
   }
 
-  async lastfmTags(track) {
-    if (!track.artist || !track.title) return [];
-    let response = await this.lastfmRequest('track.getInfo', { artist: track.artist, track: track.title });
-    let tags = tagList(response?.track?.toptags?.tag);
-    let artist = track.artist;
+  async mbSearch(entity, query) {
+    const data = await this.mbRequest(entity, { query, limit: String(MB_SEARCH_LIMIT) });
+    const key = entity === 'release-group' ? 'release-groups' : `${entity}s`;
+    return (data[key] ?? [])
+      .slice(0, MB_SEARCH_LIMIT)
+      .map((item) => item?.id)
+      .filter(Boolean);
+  }
 
-    if (!tags.length) {
-      const search = await this.lastfmRequest('track.search', {
-        artist: track.artist,
-        track: track.title,
-        limit: '3',
-      });
-      const match = search?.results?.trackmatches?.track?.[0];
-      if (match?.artist && match?.name) {
-        artist = match.artist;
-        response = await this.lastfmRequest('track.getInfo', { artist: match.artist, track: match.name });
-        tags = tagList(response?.track?.toptags?.tag);
+  async findTags(entity, query) {
+    const ids = await this.mbSearch(entity, query);
+    let best = [];
+    let bestCoverage = -1;
+    for (const id of ids) {
+      const data = await this.mbRequest(`${entity}/${id}`, { inc: 'tags+genres' });
+      const tags = combinedTags(data);
+      if (!tags.length) continue;
+      const inferred = scoreMood(tags);
+      if (inferred.mood) return tags;
+      const coverage = Object.keys(inferred.scores).length;
+      if (coverage > bestCoverage) {
+        best = tags;
+        bestCoverage = coverage;
       }
     }
+    return best;
+  }
 
-    // Last.fm often returns empty track tags. Fall back to the artist's top
-    // tags so mood inference still has useful Last.fm metadata.
-    if (!tags.length) {
-      response = await this.lastfmRequest('artist.getTopTags', { artist });
-      tags = tagList(response?.toptags?.tag);
+  async mbTags(track) {
+    const album = track.album ? `releasegroup:${phrase(track.album)}` : null;
+    const title = track.title ? `recording:${phrase(track.title)}` : null;
+    let tags = [];
+
+    for (const artistName of artistQueries(track.artist)) {
+      const artist = `artist:${phrase(artistName)}`;
+      if (album) tags = tagList([...tags, ...(await this.findTags('release-group', searchQuery([album, artist])))]);
+      if (hasMood(tags)) break;
+      if (title) tags = tagList([...tags, ...(await this.findTags('recording', searchQuery([title, artist])))]);
+      if (hasMood(tags)) break;
+      tags = tagList([...tags, ...(await this.findTags('artist', artist))]);
+      if (hasMood(tags)) break;
     }
+
     return tags;
   }
 

@@ -21,9 +21,10 @@ import {
   upsertTrackTags,
 } from '../src/db.js';
 import { Enricher } from '../src/enrichment.js';
-import { scoreMood } from '../src/mood.js';
+import { localMood, scoreMood, trackColor } from '../src/mood.js';
 import { PlayTracker } from '../src/play-detector.js';
 import { Poller } from '../src/poller.js';
+import { startServer } from '../src/server.js';
 import { getSummary, rangeBounds } from '../src/stats.js';
 import { cleanMeta, decodeMaybeHex, deviceIdForHost, fingerprint } from '../src/util.js';
 import { normalizeObservation, sourceName } from '../src/wiim.js';
@@ -106,47 +107,118 @@ test('tags map to moods', () => {
   assert.equal(scoreMood([]).mood, null);
 });
 
-test('duplicate Last.fm tags are merged before storage', async () => {
+test('local metadata infers moods without partial word matches', () => {
+  assert.equal(localMood({ title: 'Chill Ambient', artist: 'Test Artist' }).mood, 'calm');
+  assert.equal(localMood({ title: 'Dance Anthem', artist: 'Test Artist' }).mood, 'energetic');
+  assert.equal(localMood({ title: 'Sadie', artist: 'Test Artist' }).mood, null);
+  assert.equal(localMood({ title: 'Fast Car', artist: 'Tracy Chapman' }).mood, null);
+  assert.equal(localMood({ title: 'Sad Eyed Lady of the Lowlands', artist: 'Bob Dylan' }).mood, null);
+  assert.equal(localMood({ title: 'Into The Black', album: 'Kill For Love' }).mood, null);
+});
+
+test('track colors are stable', () => {
+  assert.equal(trackColor('abc123'), trackColor('abc123'));
+  assert.match(trackColor('abc123'), /^#[0-9a-f]{6}$/i);
+});
+
+test('local moods never replace a MusicBrainz mood', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-mood-'));
+  try {
+    const db = openDb(dir);
+    const track = { artist: 'Test Artist', title: 'Chill Ambient' };
+    const id = getOrCreateTrack(db, track);
+    const local = db.prepare('SELECT mood, source FROM track_mood WHERE track_id = ?').get(id);
+    assert.equal(local.mood, 'calm');
+    assert.equal(local.source, 'local');
+
+    setTrackMood(db, id, 'happy', { happy: 1 }, { source: 'musicbrainz' });
+    getOrCreateTrack(db, track);
+    const enriched = db.prepare('SELECT mood, source FROM track_mood WHERE track_id = ?').get(id);
+    assert.equal(enriched.mood, 'happy');
+    assert.equal(enriched.source, 'musicbrainz');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('MusicBrainz tags are merged before storage', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-tags-'));
   try {
     const db = openDb(dir);
-    const enricher = new Enricher(db, { lastfm: { apiKey: 'test' } });
-    enricher.lastfmRequest = async (method) => {
-      if (method !== 'track.getInfo') throw new Error(`unexpected method ${method}`);
-      return {
-        track: {
-          toptags: {
-            tag: [
-              { name: 'Rock', count: 5 },
-              { name: 'rock', count: 9 },
-              { name: 'Metal', count: 2 },
-            ],
-          },
-        },
-      };
+    const enricher = new Enricher(db);
+    enricher.mbRequest = async (path, params = {}) => {
+      if (path === 'release-group' && params.query) {
+        return { 'release-groups': [{ id: 'rg1' }] };
+      }
+      if (path === 'release-group/rg1') {
+        return {
+          tags: [
+            { name: 'Rock', count: 5 },
+            { name: 'rock', count: 9 },
+            { name: 'Metal', count: 2 },
+          ],
+          genres: [{ name: 'rock', count: 7 }],
+        };
+      }
+      throw new Error(`unexpected path ${path}`);
     };
-    const tags = await enricher.lastfmTags({ artist: 'A', title: 'B' });
+    const tags = await enricher.mbTags({ artist: 'A', title: 'B', album: 'C' });
     assert.deepEqual(tags, [
-      { name: 'Rock', weight: 9, source: 'lastfm' },
-      { name: 'Metal', weight: 2, source: 'lastfm' },
+      { name: 'Rock', weight: 9, source: 'musicbrainz' },
+      { name: 'Metal', weight: 2, source: 'musicbrainz' },
     ]);
     const trackId = getOrCreateTrack(db, { artist: 'A', title: 'B' });
-    upsertTrackTags(db, trackId, tags, 'lastfm');
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM track_tags WHERE track_id = ?').get(trackId).n, 2);
+    upsertTrackTags(db, trackId, tags, 'musicbrainz');
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM track_tags WHERE track_id = ? AND source = 'musicbrainz'").get(trackId).n, 2);
     db.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('enrichment degrades safely without API keys', () => {
+test('MusicBrainz retries rate limits and tries alternate matches', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-mbretry-'));
+  try {
+    const db = openDb(dir);
+    const enricher = new Enricher(db);
+    enricher.sleep = async () => {};
+    let requests = 0;
+    enricher.fetch = async (url) => {
+      requests += 1;
+      const parsed = new URL(url);
+      if (requests === 1) {
+        return { ok: false, status: 503, headers: { get: () => null } };
+      }
+      const json = async () => {
+        if (parsed.pathname.endsWith('/release-group')) {
+          return { 'release-groups': [{ id: 'bad' }, { id: 'good' }] };
+        }
+        if (parsed.pathname.endsWith('/release-group/bad')) return { tags: [], genres: [] };
+        if (parsed.pathname.endsWith('/release-group/good')) {
+          return { tags: [{ name: 'ambient', count: 3 }], genres: [] };
+        }
+        return {};
+      };
+      return { ok: true, status: 200, headers: { get: () => null }, json };
+    };
+
+    const tags = await enricher.mbTags({ artist: 'A', title: 'B', album: 'C' });
+    assert.deepEqual(tags, [{ name: 'ambient', weight: 3, source: 'musicbrainz' }]);
+    assert.equal(requests, 4);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('enrichment needs no API key and skips empty tracks', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-enrich-'));
   try {
     const db = openDb(dir);
-    const enricher = new Enricher(db, { lastfm: { apiKey: '' } });
-    enricher.enqueue({ title: 'A', artist: 'B' });
+    const enricher = new Enricher(db);
+    enricher.enqueue({});
     assert.equal(enricher.status().skipped, 1);
-    assert.equal(enricher.status().configured.lastfm, false);
+    assert.equal(enricher.status().configured.musicbrainz, true);
     db.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -599,6 +671,68 @@ test('short stored plays are removed on cleanup', () => {
     assert.equal(db.prepare('SELECT COUNT(*) n FROM plays').get().n, 1);
     db.close();
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deleting data removes the database and art cache without touching config', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-wipe-'));
+  const configPath = path.join(dir, 'config.json');
+  const dataDir = path.join(dir, 'data');
+  const savedConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    dataDir,
+    devices: [],
+    pollIntervalMs: 1000,
+    requestTimeoutMs: 500,
+    minPlayMs: 0,
+  };
+  fs.writeFileSync(configPath, `${JSON.stringify(savedConfig, null, 2)}\n`);
+  fs.mkdirSync(path.join(dataDir, 'art'), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'art', 'cached.txt'), 'sentinel');
+
+  const previousPort = process.env.MELUNE_PORT;
+  delete process.env.MELUNE_PORT;
+  let server;
+  let restarted = false;
+  try {
+    ({ server } = await startServer({
+      configPath,
+      restart: () => { restarted = true; },
+    }));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    assert.ok(fs.existsSync(path.join(dataDir, 'melune.db')));
+
+    const rejected = await fetch(`${base}/api/data`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: 'no' }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.ok(fs.existsSync(path.join(dataDir, 'melune.db')));
+
+    const response = await fetch(`${base}/api/data`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: 'DELETE ALL DATA' }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { deleted: true, restarting: true });
+
+    for (let attempt = 0; attempt < 80 && !restarted; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(restarted, true);
+    for (const suffix of ['', '-wal', '-shm']) {
+      assert.equal(fs.existsSync(path.join(dataDir, `melune.db${suffix}`)), false);
+    }
+    assert.equal(fs.existsSync(path.join(dataDir, 'art')), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(configPath, 'utf8')), savedConfig);
+  } finally {
+    if (previousPort === undefined) delete process.env.MELUNE_PORT;
+    else process.env.MELUNE_PORT = previousPort;
+    if (server?.listening) await new Promise((resolve) => server.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

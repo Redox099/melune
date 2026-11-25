@@ -1,10 +1,11 @@
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createArtService } from './art.js';
-import { loadConfig, saveConfig } from './config.js';
-import { endPlay, getRecentPlays, mergeDuplicatePlays, openDb, removeShortPlays } from './db.js';
+import { defaultConfigPath, loadConfig, saveConfig } from './config.js';
+import { backfillLocalMoods, endPlay, getRecentPlays, mergeDuplicatePlays, openDb, removeShortPlays } from './db.js';
 import { discoverWiimDevices, parseSubnet } from './discover.js';
 import { Enricher } from './enrichment.js';
 import { getMeta, getSummary, getTrackDetails, rangeBounds } from './stats.js';
@@ -96,9 +97,23 @@ function sendArt(res, load, errorMessage) {
     });
 }
 
-function main() {
-  const config = loadConfig();
+function defaultRestart() {
+  const entry = fileURLToPath(import.meta.url);
+  const child = spawn(process.execPath, [entry, ...process.argv.slice(2)], {
+    cwd: process.cwd(),
+    env: process.env,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  process.exit(0);
+}
+
+export async function startServer({ configPath = defaultConfigPath(), restart = defaultRestart } = {}) {
+  const config = loadConfig({ configPath });
   const db = openDb(config.dataDir);
+  const localMoods = backfillLocalMoods(db);
+  if (localMoods) console.log(`inferred ${localMoods} local moods from track metadata`);
   const merged = mergeDuplicatePlays(db);
   if (merged) console.log(`merged ${merged} duplicate play segments`);
   const skipped = removeShortPlays(db, config.minPlayMs);
@@ -106,13 +121,14 @@ function main() {
   const art = createArtService(db, config.dataDir);
   const enricher = new Enricher(db, config);
   const backfilled = enricher.backfill();
-  if (backfilled) console.log(`enriching ${backfilled} previously seen tracks with Last.fm tags`);
+  if (backfilled) console.log(`enriching ${backfilled} previously seen tracks with MusicBrainz tags`);
   const tracker = new PlayTracker(db, {
     pollIntervalMs: config.pollIntervalMs,
     minPlayMs: config.minPlayMs,
     onPlayStarted: ({ track }) => enricher.enqueue(track),
   });
   const poller = new Poller({ config, db, tracker });
+  let wiping = false;
 
   const server = http.createServer(async (req, res) => {
     const url = parseQuery(req);
@@ -122,6 +138,8 @@ function main() {
       if (route === '/api/health') {
         sendJson(res, 200, {
           ok: true,
+          pid: process.pid,
+          startedAt,
           uptimeMs: Date.now() - startedAt,
           now: Date.now(),
           devices: config.devices.length,
@@ -269,6 +287,44 @@ function main() {
         return;
       }
 
+      if (route === '/api/data' && req.method === 'DELETE') {
+        const body = await readJson(req);
+        if (body.confirm !== 'DELETE ALL DATA') {
+          sendJson(res, 400, { error: 'Type DELETE ALL DATA to confirm' });
+          return;
+        }
+        if (wiping) {
+          sendJson(res, 409, { error: 'Data deletion is already in progress' });
+          return;
+        }
+        wiping = true;
+        poller.stop();
+        sendJson(res, 200, { deleted: true, restarting: true });
+        // Give the response time to reach the browser, then wipe and restart
+        // in a fresh process so no stale in-memory play/art state survives.
+        setTimeout(() => {
+          try {
+            db.close();
+          } catch {
+            // The database may already be closed; removal does not depend on it.
+          }
+          for (const suffix of ['', '-wal', '-shm']) {
+            fs.rmSync(path.join(config.dataDir, `melune.db${suffix}`), { force: true });
+          }
+          fs.rmSync(path.join(config.dataDir, 'art'), { recursive: true, force: true });
+          let restarted = false;
+          const doRestart = () => {
+            if (restarted) return;
+            restarted = true;
+            restart();
+          };
+          server.close(doRestart);
+          server.closeAllConnections?.();
+          setTimeout(() => { if (!restarted) doRestart(); }, 3000).unref();
+        }, 500);
+        return;
+      }
+
       if (route.startsWith('/api/')) {
         sendJson(res, 404, { error: 'Unknown endpoint' });
         return;
@@ -285,12 +341,18 @@ function main() {
     }
   });
 
-  server.listen(config.port, config.host, () => {
-    console.log(`melune listening on http://${config.host}:${config.port}`);
-    console.log(`devices configured: ${config.devices.length} — poll every ${config.pollIntervalMs}ms`);
-    console.log(`database: ${path.join(config.dataDir, 'melune.db')}`);
-    if (!config.devices.length) console.warn('Add a WiiM device to config.json to start recording.');
-    poller.start();
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once('error', onError);
+    server.listen(config.port, config.host, () => {
+      server.off('error', onError);
+      console.log(`melune listening on http://${config.host}:${config.port}`);
+      console.log(`devices configured: ${config.devices.length} — poll every ${config.pollIntervalMs}ms`);
+      console.log(`database: ${path.join(config.dataDir, 'melune.db')}`);
+      if (!config.devices.length) console.warn('Add a WiiM device to config.json to start recording.');
+      poller.start();
+      resolve();
+    });
   });
 
   const shutdown = () => {
@@ -304,8 +366,14 @@ function main() {
     });
     setTimeout(() => process.exit(0), 2000).unref();
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  if (restart === defaultRestart) {
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  }
+
+  return { server, config };
 }
 
-main();
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  void startServer();
+}

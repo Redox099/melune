@@ -1,8 +1,5 @@
 const state = { range: 'today', device: '', moods: {} };
-const params = new URLSearchParams(location.search);
-const demoMode = params.get('demo') === '1';
-const lightTheme = params.get('theme') === 'light';
-const MOOD_FALLBACK = lightTheme ? '#64748b' : '#94a3b8';
+const MOOD_FALLBACK = '#94a3b8';
 let configuredHosts = new Set();
 let configuredDevices = [];
 let discoveredDevices = [];
@@ -54,8 +51,8 @@ function moodLabel(mood) {
   return state.moods?.[mood]?.label ?? (mood && mood !== 'unknown' ? String(mood) : 'Unknown');
 }
 
-function moodColor(mood) {
-  return state.moods?.[mood]?.color ?? MOOD_FALLBACK;
+function moodColor(mood, fallback) {
+  return state.moods?.[mood]?.color ?? fallback ?? MOOD_FALLBACK;
 }
 
 function playingMoods() {
@@ -75,16 +72,17 @@ function updateMoodGlow() {
   }
 }
 
-function moodRgba(mood, alpha) {
-  const hex = String(moodColor(mood)).replace('#', '');
-  if (!/^[\da-f]{6}$/i.test(hex)) {
-    const fallback = MOOD_FALLBACK.slice(1);
-    return `rgba(${parseInt(fallback.slice(0, 2), 16)}, ${parseInt(fallback.slice(2, 4), 16)}, ${parseInt(fallback.slice(4, 6), 16)}, ${alpha})`;
-  }
-  const r = parseInt(hex.slice(0, 2), 16);
-  const g = parseInt(hex.slice(2, 4), 16);
-  const b = parseInt(hex.slice(4, 6), 16);
+function colorRgba(color, alpha) {
+  const hex = String(color ?? MOOD_FALLBACK).replace('#', '');
+  const safe = /^[\da-f]{6}$/i.test(hex) ? hex : MOOD_FALLBACK.slice(1);
+  const r = parseInt(safe.slice(0, 2), 16);
+  const g = parseInt(safe.slice(2, 4), 16);
+  const b = parseInt(safe.slice(4, 6), 16);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function moodRgba(mood, alpha, fallback) {
+  return colorRgba(moodColor(mood, fallback), alpha);
 }
 
 function empty(message) {
@@ -124,20 +122,20 @@ async function api(path, options = {}) {
 }
 
 function renderHealth(health) {
-  const dot = $('#health-dot');
   const running = Boolean(health?.poller?.running);
-  dot.className = `health-dot ${running ? 'online' : 'offline'}`;
-  $('#health-text').textContent = running
-    ? `${health.devices} device${health.devices === 1 ? '' : 's'} · polling every ${(health.poller.pollIntervalMs / 1000).toFixed(0)}s`
-    : 'Poller stopped';
-  const enrichment = health?.enrichment;
-  if (enrichment) {
-    const sources = Object.entries(enrichment.configured ?? {})
-      .filter(([, enabled]) => enabled)
-      .map(([name]) => name);
-    $('#footer-status').textContent = sources.length
-      ? `mood tags: ${sources.join(' + ')} · ${enrichment.enriched} enriched`
-      : 'mood tags: not configured';
+  const dot = $('#health-dot');
+  if (dot) dot.className = `health-dot ${running ? 'online' : 'offline'}`;
+  const devices = $('#health-devices');
+  const poll = $('#health-poll');
+  if (devices) {
+    devices.textContent = running
+      ? `${health.devices} device${health.devices === 1 ? '' : 's'}`
+      : 'Poller stopped';
+  }
+  if (poll) {
+    poll.textContent = running
+      ? `polling every ${(health.poller.pollIntervalMs / 1000).toFixed(0)}s`
+      : '';
   }
 }
 
@@ -160,18 +158,20 @@ function renderDevices(devices) {
   updateMoodGlow();
 }
 
-function moodVars(mood, colorByMood) {
-  if (!colorByMood || !mood || mood === 'unknown') return {};
+function moodVars(mood, colorByMood, fallbackColor) {
+  if (!colorByMood) return {};
+  const color = moodColor(mood, fallbackColor);
+  if (!color) return {};
   return {
-    '--mood-color': moodColor(mood),
-    '--mood-border': moodRgba(mood, 0.24),
-    '--mood-soft': moodRgba(mood, 0.1),
-    '--mood-glow': moodRgba(mood, 0.85),
+    '--mood-color': color,
+    '--mood-border': colorRgba(color, 0.24),
+    '--mood-soft': colorRgba(color, 0.1),
+    '--mood-glow': colorRgba(color, 0.85),
   };
 }
 
-function applyMoodVars(card, mood, colorByMood) {
-  const vars = moodVars(mood, colorByMood);
+function applyMoodVars(card, mood, colorByMood, fallbackColor) {
+  const vars = moodVars(mood, colorByMood, fallbackColor);
   for (const name of MOOD_VARS) {
     if (vars[name]) card.style.setProperty(name, vars[name]);
     else card.style.removeProperty(name);
@@ -187,10 +187,11 @@ function nowCard(device) {
   const progress = progressFor(current);
   const showProgress = playing || current?.status === 'pause';
   const mood = current?.mood ?? null;
-  const moodVar = Object.entries(moodVars(mood, playing))
+  const fallbackColor = current?.color ?? null;
+  const moodVar = Object.entries(moodVars(mood, playing, fallbackColor))
     .map(([name, value]) => `${name}:${esc(value)};`)
     .join('');
-  return { playing, status, title, artist, progress, showProgress, mood,
+  return { playing, status, title, artist, progress, showProgress, mood, fallbackColor,
     html: `<article class="now-card ${playing ? 'playing' : ''}" style="${moodVar}">
       <div class="now-top">
         <span class="device-name">${esc(device.name)}</span>
@@ -293,11 +294,11 @@ function renderNow(devices) {
       void card.offsetWidth;
       requestAnimationFrame(() => {
         if (moodTokens.get(device.id) === token && card.isConnected) {
-          applyMoodVars(card, view.mood, view.playing);
+          applyMoodVars(card, view.mood, view.playing, view.fallbackColor);
         }
       });
     } else {
-      applyMoodVars(card, view.mood, view.playing);
+      applyMoodVars(card, view.mood, view.playing, view.fallbackColor);
     }
     const progressEl = card.querySelector('.progress');
     const bar = progressEl.querySelector('span');
@@ -361,7 +362,7 @@ function renderMoods(moods) {
     .filter((row) => row.mood && row.mood !== 'unknown')
     .sort((a, b) => b.plays - a.plays);
   if (!known.length) {
-    target.innerHTML = empty('No mood tags yet. Add a Last.fm API key to config.json.');
+    target.innerHTML = empty('Moods appear once tracks are tagged');
     return;
   }
   const total = known.reduce((sum, row) => sum + row.plays, 0);
@@ -393,22 +394,6 @@ function renderArtists(artists) {
   </div>`).join('');
 }
 
-function demoTimeline() {
-  const plays = [12, 18, 9, 24, 31, 14, 20, 7, 16, 28, 35, 22, 11, 19, 26, 13, 30, 38, 17, 25, 21];
-  const moods = [
-    'calm', 'happy', 'energetic', 'focused', 'calm', 'nostalgic', 'happy',
-    'sad', 'calm', 'energetic', 'dreamy', 'happy', 'focused', 'calm',
-    'romantic', 'energetic', 'nostalgic', 'happy', 'aggressive', 'calm', 'focused',
-  ];
-  const today = new Date();
-  return plays.map((count, index) => ({
-    day: new Date(today.getTime() - (plays.length - 1 - index) * 86400000).toISOString().slice(0, 10),
-    plays: count,
-    playedMs: count * 4 * 60_000,
-    mood: moods[index],
-  }));
-}
-
 function renderTimeline(timeline) {
   const target = $('#timeline');
   const items = (timeline ?? []).slice(-21);
@@ -420,7 +405,7 @@ function renderTimeline(timeline) {
   target.innerHTML = items.map((item) => {
     const height = Math.max(5, (item.plays / max) * 100);
     const mood = item.mood && item.mood !== 'unknown' ? item.mood : null;
-    const color = mood ? moodColor(mood) : 'var(--accent)';
+    const color = item.color ?? (mood ? moodColor(mood) : 'var(--accent)');
     const label = mood ? ` · ${moodLabel(mood)}` : '';
     return `<div class="timeline-bar" title="${esc(item.day)}: ${item.plays} plays${esc(label)}">
       <b class="timeline-count">${number(item.plays)}</b>
@@ -496,16 +481,15 @@ async function refresh() {
   if (devices.status === 'fulfilled') renderDevices(devices.value.devices ?? []);
   if (stats.status === 'fulfilled') {
     const data = stats.value;
-    paint('kpis', [data.totals, data.moods], () => renderKpis(data));
+    paint('kpis', [data.totals], () => renderKpis(data));
     // playedMs grows every poll but is not shown in these sections — using it
     // in the signature would rebuild covers constantly.
     paint('tracks', (data.topTracks ?? []).map((t) => [t.id, t.title, t.artist, t.mood, t.plays, t.hasArt]),
       () => renderTracks(data.topTracks ?? []));
     paint('moods', (data.moods ?? []).map((m) => [m.mood, m.plays]),
       () => renderMoods(data.moods ?? []));
-    paint('artists', data.topArtists, () => renderArtists(data.topArtists ?? []));
-    const timeline = demoMode ? demoTimeline() : data.timeline ?? [];
-    paint('timeline', timeline, () => renderTimeline(timeline));
+    paint('artists', data.topArtists ?? [], () => renderArtists(data.topArtists ?? []));
+    paint('timeline', data.timeline ?? [], () => renderTimeline(data.timeline ?? []));
   }
   if (plays.status === 'fulfilled') renderPlays(plays.value.plays ?? []);
 }
@@ -626,10 +610,8 @@ async function removeDevice(host, name) {
     renderDiscovery();
     discoveryStatus(`${name || host} removed. Past listening history is kept.`);
     await refresh();
-    $('#footer-status').textContent = `${name || host} removed from tracking`;
   } catch (error) {
     discoveryStatus(`Could not remove ${host}: ${error.message}`);
-    $('#footer-status').textContent = `Could not remove ${name || host}: ${error.message}`;
   }
 }
 
@@ -658,6 +640,48 @@ function bind() {
     const remove = event.target.closest('.discover-remove');
     if (remove) void removeDevice(remove.dataset.host, remove.dataset.name);
   });
+  $('#delete-data').addEventListener('click', () => {
+    $('#delete-dialog').showModal();
+    $('#delete-status').textContent = '';
+    $('#delete-confirm').disabled = false;
+  });
+  $('#delete-confirm').addEventListener('click', () => void deleteAllData());
+}
+
+async function waitForRestart(previous) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      const health = await api('/api/health');
+      if (previous?.pid && previous?.startedAt
+        && (health.pid !== previous.pid || health.startedAt !== previous.startedAt)) return true;
+    } catch {
+      // The old server is closing; wait for the new one.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
+async function deleteAllData() {
+  const button = $('#delete-confirm');
+  const status = $('#delete-status');
+  button.disabled = true;
+  status.textContent = 'Deleting data and restarting…';
+  try {
+    const before = await api('/api/health');
+    await api('/api/data', {
+      method: 'DELETE',
+      body: JSON.stringify({ confirm: 'DELETE ALL DATA' }),
+    });
+    status.textContent = 'Done. Reloading…';
+    if (!await waitForRestart(before)) {
+      status.textContent = 'Data deleted. Refresh the page when the server is back.';
+      button.disabled = false;
+    }
+  } catch (error) {
+    status.textContent = `Could not delete data: ${error.message}`;
+    button.disabled = false;
+  }
 }
 
 async function init() {
@@ -667,7 +691,6 @@ async function init() {
   } catch {
     // UI still works with fallback mood labels.
   }
-  if (demoMode) $('#activity-hint').textContent = 'example data';
   bind();
   await refresh();
   setInterval(() => void refresh(), 15_000);

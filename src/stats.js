@@ -1,5 +1,5 @@
 import { getTrack } from './db.js';
-import { MOODS } from './mood.js';
+import { MOODS, moodColor, trackColor } from './mood.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -97,6 +97,14 @@ export function getSummary(db, options = {}) {
         LEFT JOIN track_mood m ON m.track_id = t.id
        WHERE ${sql}
        GROUP BY day, mood
+    ), day_tracks AS (
+      SELECT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch') AS day,
+             t.id AS trackId,
+             COUNT(*) AS trackPlays
+        FROM plays p
+        JOIN tracks t ON t.id = p.track_id
+       WHERE ${sql}
+       GROUP BY day, t.id
     ), ranked AS (
       SELECT day, mood,
              ROW_NUMBER() OVER (
@@ -106,12 +114,25 @@ export function getSummary(db, options = {}) {
                         mood
              ) AS rn
         FROM day_moods
+    ), ranked_tracks AS (
+      SELECT day, trackId,
+             ROW_NUMBER() OVER (
+               PARTITION BY day
+               ORDER BY trackPlays DESC, trackId
+             ) AS rn
+        FROM day_tracks
     )
-    SELECT d.day, d.plays, d.playedMs, r.mood
+    SELECT d.day, d.plays, d.playedMs, r.mood, rt.trackId
       FROM day_counts d
       LEFT JOIN ranked r ON r.day = d.day AND r.rn = 1
+      LEFT JOIN ranked_tracks rt ON rt.day = d.day AND rt.rn = 1
      ORDER BY d.day
-  `).all(...params, ...params);
+  `).all(...params, ...params, ...params).map((row) => ({
+    ...row,
+    color: row.mood && row.mood !== 'unknown'
+      ? moodColor(row.mood)
+      : trackColor(row.trackId),
+  }));
 
   return {
     totals: {
@@ -138,13 +159,14 @@ export function getTrackDetails(db, trackId) {
   const tags = db.prepare(`
     SELECT source, tag, weight FROM track_tags WHERE track_id = ? ORDER BY weight DESC, tag
   `).all(trackId);
-  const moodRow = db.prepare('SELECT mood, scores, fetched_at FROM track_mood WHERE track_id = ?').get(trackId);
+  const moodRow = db.prepare('SELECT mood, scores, source, fetched_at FROM track_mood WHERE track_id = ?').get(trackId);
   return {
     track,
     totals: { plays: totals.plays ?? 0, playedMs: totals.playedMs ?? 0, lastPlayedAt: totals.lastPlayedAt ?? null },
     tags,
     mood: moodRow?.mood ?? null,
     scores: moodRow?.scores ? JSON.parse(moodRow.scores) : {},
+    source: moodRow?.source ?? null,
     fetchedAt: moodRow?.fetched_at ?? null,
   };
 }

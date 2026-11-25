@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { localMood, localMoodTags } from './mood.js';
 import { fingerprint, normalizeText } from './util.js';
 
 export const MERGE_GAP_MS = 10 * 60 * 1000;
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS track_mood (
   track_id TEXT PRIMARY KEY REFERENCES tracks(id),
   mood TEXT,
   scores TEXT,
+  source TEXT NOT NULL DEFAULT 'musicbrainz',
   fetched_at INTEGER NOT NULL
 );
 
@@ -81,7 +83,22 @@ export function openDb(dataDir) {
   const db = new DatabaseSync(path.join(dataDir, 'melune.db'));
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA);
-  db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run('schema_version', '1');
+  if (!db.prepare('PRAGMA table_info(track_mood)').all().some((column) => column.name === 'source')) {
+    db.exec("ALTER TABLE track_mood ADD COLUMN source TEXT NOT NULL DEFAULT 'musicbrainz'");
+    db.exec("UPDATE track_mood SET source = 'local' WHERE mood IS NULL");
+  }
+  const version = Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value ?? 0);
+  if (version < 3) {
+    // Local inference rules changed; discard old guesses so startup can redo them.
+    db.exec("UPDATE track_mood SET mood = NULL, scores = NULL WHERE source = 'local'");
+    db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')").run();
+  }
+  if (version < 4) {
+    // Last.fm is no longer a tag source; queue those tracks for MusicBrainz.
+    db.exec("DELETE FROM track_tags WHERE source = 'lastfm'");
+    db.exec("UPDATE track_mood SET mood = NULL, scores = NULL, source = 'local' WHERE source = 'lastfm'");
+    db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')").run();
+  }
   return db;
 }
 
@@ -140,7 +157,26 @@ export function getOrCreateTrack(db, track = {}) {
     artUri: track.artUri ?? null,
     at,
   });
+  ensureLocalMood(db, id, track, at);
   return id;
+}
+
+function ensureLocalMood(db, id, track, at = Date.now()) {
+  const existing = db.prepare('SELECT source, mood FROM track_mood WHERE track_id = ?').get(id);
+  if (existing && (existing.mood || existing.source !== 'local')) return false;
+  const tags = localMoodTags(track);
+  const { mood, scores } = localMood(track);
+  if (tags.length) upsertTrackTags(db, id, tags, 'local', at);
+  setTrackMood(db, id, mood, scores, { source: 'local', fetchedAt: at });
+  return true;
+}
+
+export function backfillLocalMoods(db, limit = 500) {
+  let filled = 0;
+  for (const track of getTracksForLocalMood(db, limit)) {
+    if (ensureLocalMood(db, track.id, track)) filled += 1;
+  }
+  return filled;
 }
 
 export function getOpenPlay(db, deviceId) {
@@ -217,7 +253,20 @@ export function getTracksForEnrichment(db, limit = 100) {
     SELECT t.id, t.title, t.artist, t.album, t.art_uri
       FROM tracks t
       LEFT JOIN track_mood m ON m.track_id = t.id
-     WHERE (m.track_id IS NULL OR m.mood IS NULL)
+     WHERE (m.track_id IS NULL OR m.mood IS NULL OR m.source = 'local')
+       AND COALESCE(t.title, '') <> ''
+       AND COALESCE(t.artist, '') <> ''
+     ORDER BY t.updated_at DESC
+     LIMIT ?
+  `).all(limit);
+}
+
+export function getTracksForLocalMood(db, limit = 500) {
+  return db.prepare(`
+    SELECT t.id, t.title, t.artist, t.album
+      FROM tracks t
+      LEFT JOIN track_mood m ON m.track_id = t.id
+     WHERE (m.track_id IS NULL OR (m.mood IS NULL AND m.source = 'local'))
        AND COALESCE(t.title, '') <> ''
        AND COALESCE(t.artist, '') <> ''
      ORDER BY t.updated_at DESC
@@ -243,11 +292,21 @@ export function upsertTrackTags(db, trackId, tags, source, fetchedAt = Date.now(
   }
 }
 
-export function setTrackMood(db, trackId, mood, scores, fetchedAt = Date.now()) {
+export function setTrackMood(db, trackId, mood, scores, options = {}) {
+  const { fetchedAt = Date.now(), source = 'musicbrainz' } =
+    typeof options === 'number' ? { fetchedAt: options } : options;
+  const existing = db.prepare('SELECT source, mood FROM track_mood WHERE track_id = ?').get(trackId);
+  // A local guess must never replace a mood inferred from real MusicBrainz tags.
+  if (source === 'local' && existing?.source === 'musicbrainz' && existing.mood) return false;
   db.prepare(`
-    INSERT INTO track_mood (track_id, mood, scores, fetched_at) VALUES (?, ?, ?, ?)
-    ON CONFLICT(track_id) DO UPDATE SET mood = excluded.mood, scores = excluded.scores, fetched_at = excluded.fetched_at
-  `).run(trackId, mood, JSON.stringify(scores ?? {}), fetchedAt);
+    INSERT INTO track_mood (track_id, mood, scores, source, fetched_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(track_id) DO UPDATE SET
+      mood = excluded.mood,
+      scores = excluded.scores,
+      source = excluded.source,
+      fetched_at = excluded.fetched_at
+  `).run(trackId, mood, JSON.stringify(scores ?? {}), source, fetchedAt);
+  return true;
 }
 
 export function artistKey(artist) {

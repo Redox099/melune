@@ -4,29 +4,28 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0a0b0c" />
-  <script>
-    (() => {
-      const light = new URLSearchParams(location.search).get('theme') === 'light';
-      document.documentElement.dataset.theme = light ? 'light' : 'dark';
-      document.querySelector('meta[name="theme-color"]').content = light ? '#f4f5f7' : '#0a0b0c';
-    })();
-  </script>
   <title>melune — listening history</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hachi+Maru+Pop&display=swap" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <div class="logo" aria-hidden="true">m</div>
         <div class="brand-copy">
           <h1>melune</h1>
-          <p>Everything your WiiM has been playing</p>
+          <p>Your listening history</p>
         </div>
       </div>
       <div class="health" id="health">
+        <span class="health-copy">
+          <span id="health-devices">Connecting…</span>
+          <span id="health-poll"></span>
+        </span>
         <span class="health-dot" id="health-dot"></span>
-        <span id="health-text">Connecting…</span>
       </div>
     </header>
 
@@ -76,7 +75,7 @@
       </div>
 
       <section class="card">
-        <div class="section-head"><h2>Activity</h2><span class="hint" id="activity-hint"></span></div>
+        <div class="section-head"><h2>Activity</h2></div>
         <div class="timeline" id="timeline"></div>
       </section>
 
@@ -92,8 +91,9 @@
     </main>
 
     <footer>
-      <span>Data stays on this machine. Art is cached locally; Last.fm is contacted only for tags when configured, Deezer for artist photos.</span>
-      <span id="footer-status"></span>
+      <span class="footer-credit">Build by Redox</span>
+      <span>Data stays on this machine. Art is cached locally; MusicBrainz supplies tags, Deezer supplies artist photos.</span>
+      <button type="button" id="delete-data" class="discover-remove">Delete data</button>
     </footer>
   </div>
 
@@ -106,10 +106,24 @@
       <button type="submit" class="discover-close" aria-label="Close">×</button>
     </form>
     <div class="discover-tools">
-      <button type="button" id="discover-scan">Scan</button>
+      <button type="button" id="discover-scan" class="discover-button">Scan</button>
     </div>
     <p class="discover-status"><span class="scan-spinner" id="scan-spinner" aria-hidden="true" hidden></span><span id="discover-status">Press Scan to look for WiiM devices on your network.</span></p>
     <div class="discover-results" id="discover-results"></div>
+  </dialog>
+
+  <dialog class="discover-dialog" id="delete-dialog">
+    <form method="dialog" class="discover-head">
+      <div>
+        <h2>Delete all data?</h2>
+        <p>This permanently removes all listening history and cached art. Your devices stay configured.</p>
+      </div>
+      <button type="submit" class="discover-close" aria-label="Close">×</button>
+    </form>
+    <div class="discover-tools">
+      <button type="button" class="discover-remove" id="delete-confirm">Delete everything</button>
+    </div>
+    <p class="discover-status" id="delete-status"></p>
   </dialog>
   <script type="module" src="/app.js"></script>
 </body>

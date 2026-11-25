@@ -28,15 +28,22 @@ const RULES = [
   { re: /gospel|christmas|holiday/i, weights: { happy: 1.5, nostalgic: 1 } },
 ];
 
-/** Convert Last.fm tags into a normalized mood score map. */
-export function scoreMood(tags = []) {
+// Local metadata is noisier than curated tags, so match whole words there.
+const WORD_RULES = RULES.map((rule) => ({
+  ...rule,
+  re: new RegExp(`(?:^|\\s)(?:${rule.re.source})(?=\\s|$)`, rule.re.flags),
+}));
+
+/** Convert tags into a normalized mood score map. */
+export function scoreMood(tags = [], { wordBoundaries = false } = {}) {
+  const rules = wordBoundaries ? WORD_RULES : RULES;
   const scores = Object.fromEntries(Object.keys(MOODS).map((mood) => [mood, 0]));
   for (const tag of tags) {
     const name = normalizeText(tag?.name);
     if (!name) continue;
     const weight = Number(tag.weight) || 1;
     const scale = 1 + Math.log2(1 + Math.max(0, weight)) * 0.3;
-    for (const rule of RULES) {
+    for (const rule of rules) {
       if (!rule.re.test(name)) continue;
       for (const [mood, value] of Object.entries(rule.weights)) {
         scores[mood] += value * scale;
@@ -59,4 +66,64 @@ export function moodLabel(mood) {
 
 export function moodColor(mood) {
   return MOODS[mood]?.color ?? '#6b7280';
+}
+
+// Ordinary words such as "fast" or "sad" are too ambiguous to infer a mood
+// from a title. Local inference only trusts genre-like words and known phrases.
+const RELIABLE_LOCAL_WORDS = new Set([
+  'calm', 'chill', 'relax', 'ambient', 'mellow', 'downtempo', 'acoustic',
+  'bossa', 'jazz', 'classical', 'lofi', 'lo', 'fi',
+  'melancholy', 'melancholic', 'heartbreak', 'blues', 'lonely', 'grief',
+  'study', 'instrumental', 'soundtrack', 'minimal',
+  'romantic', 'ballad', 'serenade', 'soul',
+  'retro', 'oldies', 'vintage', 'throwback', 'nostalgic', '80s', '90s', '00s',
+  'energetic', 'workout', 'dance', 'electronic', 'edm', 'house', 'techno',
+  'trance', 'dnb', 'cheerful', 'upbeat', 'sunny', 'joyful', 'party', 'disco',
+  'funk', 'pop', 'aggressive', 'metal', 'punk', 'hardcore', 'screamo',
+  'grunge', 'rage', 'shoegaze', 'psychedelic', 'ethereal', 'surreal',
+  'cosmic', 'dreamy', 'alternative', 'indie', 'britpop', 'hiphop', 'rap',
+  'trap', 'grime', 'folk', 'gospel', 'christmas', 'holiday',
+]);
+
+const LOCAL_PHRASES = [
+  'feel good', 'high energy', 'drum and bass', 'easy listening', 'lo fi',
+  'post rock', 'dream pop', 'trip hop', 'singer songwriter', 'hip hop',
+  'r n b', 'classic rock', 'psychedelic rock', 'progressive rock',
+  'art rock', 'alternative rock', 'indie rock',
+];
+
+/** Build pseudo-tags from metadata so offline mood inference reuses the rules. */
+export function localMoodTags(track = {}) {
+  const tags = [];
+  for (const field of ['title', 'artist', 'album']) {
+    const text = normalizeText(track[field]);
+    if (!text) continue;
+    for (const phrase of LOCAL_PHRASES) {
+      if (text.includes(phrase)) tags.push({ name: phrase, weight: 2 });
+    }
+    for (const word of text.split(' ')) {
+      if (RELIABLE_LOCAL_WORDS.has(word)) tags.push({ name: word, weight: 1 });
+    }
+  }
+  return tags.slice(0, 60);
+}
+
+/** Best-effort local mood inference; no network or API key required. */
+export function localMood(track = {}) {
+  return scoreMood(localMoodTags(track), { wordBoundaries: true });
+}
+
+const TRACK_COLORS = [
+  '#0284c7', '#7c3aed', '#db2777', '#059669', '#d97706', '#0d9488',
+  '#6366f1', '#e11d48', '#ea580c', '#2563eb', '#65a30d', '#c026d3',
+];
+
+/** Stable decorative color for tracks that have no mood. */
+export function trackColor(trackId = '') {
+  const text = String(trackId || 'unknown');
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (Math.imul(hash, 31) + text.charCodeAt(index)) >>> 0;
+  }
+  return TRACK_COLORS[hash % TRACK_COLORS.length];
 }

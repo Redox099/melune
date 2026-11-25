@@ -1,4 +1,5 @@
 import { getDevices, getTrackMood, markDevicePolled, mergeDuplicatePlays, upsertDevice } from './db.js';
+import { moodColor, trackColor } from './mood.js';
 import { fingerprint } from './util.js';
 import { deviceInfoFromStatus, fetchObservation, getStatusEx } from './wiim.js';
 
@@ -10,12 +11,14 @@ export class Poller {
     this.current = new Map();
     this.errors = new Map();
     this.running = false;
+    this.stopping = false;
     this.timer = null;
     this.ticks = 0;
   }
 
   start() {
     if (this.running) return;
+    this.stopping = false;
     this.running = true;
     for (const device of this.config.devices) void this.refreshDeviceInfo(device);
     void this.loop();
@@ -23,6 +26,7 @@ export class Poller {
 
   stop() {
     this.running = false;
+    this.stopping = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
@@ -34,7 +38,7 @@ export class Poller {
     } catch (error) {
       console.error('[poll] unexpected tick error:', error.message);
     }
-    if (this.running) {
+    if (!this.stopping && this.running) {
       this.timer = setTimeout(() => void this.loop(), this.config.pollIntervalMs);
     }
   }
@@ -46,7 +50,7 @@ export class Poller {
   async refreshDeviceInfo(device) {
     try {
       const status = await getStatusEx(device.host, { timeoutMs: this.config.requestTimeoutMs });
-      if (!this.hasDevice(device)) return;
+      if (this.stopping || !this.hasDevice(device)) return;
       upsertDevice(this.db, device, deviceInfoFromStatus(status));
     } catch {
       // Device info is cosmetic; offline devices are reported by the normal poll.
@@ -56,14 +60,14 @@ export class Poller {
   async pollDevice(device) {
     try {
       const observation = await fetchObservation(device, { timeoutMs: this.config.requestTimeoutMs });
-      if (!this.hasDevice(device)) return;
+      if (this.stopping || !this.hasDevice(device)) return;
       upsertDevice(this.db, device, {}, observation.at);
       markDevicePolled(this.db, device.id, observation.at, null);
       this.current.set(device.id, observation);
       this.errors.delete(device.id);
       this.tracker.observe(device.id, observation);
     } catch (error) {
-      if (!this.hasDevice(device)) return;
+      if (this.stopping || !this.hasDevice(device)) return;
       markDevicePolled(this.db, device.id, Date.now(), error.message);
       this.errors.set(device.id, error.message);
     }
@@ -75,6 +79,7 @@ export class Poller {
       if (!this.hasDevice(device)) continue;
       await this.pollDevice(device);
     }
+    if (this.stopping) return;
     // The tracker merges most split plays live; this also catches brief
     // metadata glitches that briefly look like a new track.
     mergeDuplicatePlays(this.db);
@@ -116,6 +121,8 @@ export class Poller {
       const trackId = current?.track?.title || current?.track?.artist || current?.track?.album
         ? fingerprint(current.track)
         : null;
+      const mood = trackId ? getTrackMood(this.db, trackId) : null;
+      const color = mood ? moodColor(mood) : trackColor(trackId);
       return {
         id: device.id,
         name: row?.name || device.name,
@@ -129,7 +136,8 @@ export class Poller {
               source: current.source,
               track: current.track,
               trackId,
-              mood: getTrackMood(this.db, trackId),
+              mood,
+              color,
               hasArt: Boolean(current.track?.artUri),
               positionMs: current.positionMs,
               durationMs: current.durationMs,
