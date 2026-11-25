@@ -2,6 +2,7 @@ import { getTrack } from './db.js';
 import { MOODS, moodColor } from './mood.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const DAY_SQL = "strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch', 'localtime')";
 
 export function rangeBounds(range = 'week', now = Date.now()) {
   if (range === 'today') {
@@ -30,7 +31,7 @@ export function getSummary(db, options = {}) {
     SELECT COUNT(*) AS plays,
            COUNT(DISTINCT p.track_id) AS uniqueTracks,
            COALESCE(SUM(p.played_ms), 0) AS playedMs,
-           COUNT(DISTINCT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch')) AS activeDays
+           COUNT(DISTINCT ${DAY_SQL}) AS activeDays
       FROM plays p
      WHERE ${sql}
   `).get(...params);
@@ -82,14 +83,14 @@ export function getSummary(db, options = {}) {
 
   const timeline = db.prepare(`
     WITH day_counts AS (
-      SELECT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch') AS day,
+      SELECT ${DAY_SQL} AS day,
              COUNT(*) AS plays,
              COALESCE(SUM(p.played_ms), 0) AS playedMs
         FROM plays p
        WHERE ${sql}
        GROUP BY day
     ), day_moods AS (
-      SELECT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch') AS day,
+      SELECT ${DAY_SQL} AS day,
              COALESCE(m.mood, 'unknown') AS mood,
              COUNT(*) AS moodPlays
         FROM plays p
@@ -98,7 +99,7 @@ export function getSummary(db, options = {}) {
        WHERE ${sql}
        GROUP BY day, mood
     ), day_tracks AS (
-      SELECT strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch') AS day,
+      SELECT ${DAY_SQL} AS day,
              t.id AS trackId,
              COUNT(*) AS trackPlays
         FROM plays p

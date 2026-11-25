@@ -122,7 +122,7 @@ It shows:
 - The 30 most recent play events, with device, source, and listened duration.
 
 There is no light theme and no demo dataset. Every chart always comes from the
-local database.
+local database. Date ranges and daily activity buckets use local time.
 
 ## How plays are recorded
 

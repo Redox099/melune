@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { createArtService, detectImageType } from '../src/art.js';
 import { hostsFor, parseSubnet } from '../src/discover.js';
@@ -733,6 +735,79 @@ test('deleting data removes the database and art cache without touching config',
     if (previousPort === undefined) delete process.env.MELUNE_PORT;
     else process.env.MELUNE_PORT = previousPort;
     if (server?.listening) await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a second instance fails before touching the database', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-port-'));
+  const firstDir = path.join(dir, 'first');
+  const secondDir = path.join(dir, 'second');
+  fs.mkdirSync(firstDir);
+  fs.mkdirSync(secondDir);
+  const firstConfig = path.join(dir, 'first.json');
+  const secondConfig = path.join(dir, 'second.json');
+  const previousPort = process.env.MELUNE_PORT;
+  delete process.env.MELUNE_PORT;
+  let server;
+  let poller;
+  try {
+    fs.writeFileSync(firstConfig, `${JSON.stringify({
+      host: '127.0.0.1', port: 0, dataDir: firstDir, devices: [],
+    }, null, 2)}\n`);
+    ({ server, poller } = await startServer({ configPath: firstConfig, restart: () => {} }));
+    const port = server.address().port;
+
+    const seed = openDb(secondDir);
+    const trackId = getOrCreateTrack(seed, { artist: 'Test Artist', title: 'Chill Ambient' });
+    seed.prepare("UPDATE track_mood SET mood = NULL, scores = NULL, source = 'local' WHERE track_id = ?").run(trackId);
+    seed.close();
+    fs.writeFileSync(secondConfig, `${JSON.stringify({
+      host: '127.0.0.1', port, dataDir: secondDir, devices: [],
+    }, null, 2)}\n`);
+
+    await assert.rejects(
+      startServer({ configPath: secondConfig, restart: () => {} }),
+      /EADDRINUSE/,
+    );
+    const check = openDb(secondDir);
+    const mood = check.prepare('SELECT mood FROM track_mood WHERE track_id = ?').get(trackId);
+    assert.equal(mood.mood, null);
+    check.close();
+  } finally {
+    if (previousPort === undefined) delete process.env.MELUNE_PORT;
+    else process.env.MELUNE_PORT = previousPort;
+    poller?.stop();
+    if (server?.listening) await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('timeline days use local time', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-timezone-'));
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const script = `
+    import path from 'node:path';
+    import { pathToFileURL } from 'node:url';
+    const root = ${JSON.stringify(root)};
+    const { openDb, upsertDevice, getOrCreateTrack, startPlay } =
+      await import(pathToFileURL(path.join(root, 'src/db.js')).href);
+    const { getSummary } =
+      await import(pathToFileURL(path.join(root, 'src/stats.js')).href);
+    const db = openDb(process.env.MELUNE_TEST_DIR);
+    upsertDevice(db, { id: 'd1', name: 'D', host: '1.2.3.4' }, {}, 1000);
+    const trackId = getOrCreateTrack(db, { artist: 'A', title: 'T' });
+    const startedAt = Date.parse('2026-06-01T23:00:00Z');
+    startPlay(db, { deviceId: 'd1', trackId, startedAt, source: 'wiim', positionStartMs: 0 });
+    console.log(JSON.stringify({ day: getSummary(db, { from: 0, to: Date.now() }).timeline[0].day }));
+  `;
+  try {
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      env: { ...process.env, TZ: 'Europe/Copenhagen', MELUNE_TEST_DIR: dir },
+      encoding: 'utf8',
+    });
+    assert.equal(JSON.parse(output).day, '2026-06-02');
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

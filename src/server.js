@@ -112,16 +112,8 @@ function defaultRestart() {
 export async function startServer({ configPath = defaultConfigPath(), restart = defaultRestart } = {}) {
   const config = loadConfig({ configPath });
   const db = openDb(config.dataDir);
-  const localMoods = backfillLocalMoods(db);
-  if (localMoods) console.log(`inferred ${localMoods} local moods from track metadata`);
-  const merged = mergeDuplicatePlays(db);
-  if (merged) console.log(`merged ${merged} duplicate play segments`);
-  const skipped = removeShortPlays(db, config.minPlayMs);
-  if (skipped) console.log(`removed ${skipped} skipped plays under ${config.minPlayMs}ms`);
   const art = createArtService(db, config.dataDir);
   const enricher = new Enricher(db, config);
-  const backfilled = enricher.backfill();
-  if (backfilled) console.log(`enriching ${backfilled} previously seen tracks with MusicBrainz tags`);
   const tracker = new PlayTracker(db, {
     pollIntervalMs: config.pollIntervalMs,
     minPlayMs: config.minPlayMs,
@@ -350,10 +342,21 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
       console.log(`devices configured: ${config.devices.length} — poll every ${config.pollIntervalMs}ms`);
       console.log(`database: ${path.join(config.dataDir, 'melune.db')}`);
       if (!config.devices.length) console.warn('Add a WiiM device to config.json to start recording.');
-      poller.start();
       resolve();
     });
   });
+
+  // Startup maintenance runs only after the port is secured, so a second
+  // instance fails immediately instead of touching the database.
+  const localMoods = backfillLocalMoods(db);
+  if (localMoods) console.log(`inferred ${localMoods} local moods from track metadata`);
+  const merged = mergeDuplicatePlays(db);
+  if (merged) console.log(`merged ${merged} duplicate play segments`);
+  const skipped = removeShortPlays(db, config.minPlayMs);
+  if (skipped) console.log(`removed ${skipped} skipped plays under ${config.minPlayMs}ms`);
+  const backfilled = enricher.backfill();
+  if (backfilled) console.log(`enriching ${backfilled} previously seen tracks with MusicBrainz tags`);
+  poller.start();
 
   const shutdown = () => {
     poller.stop();
@@ -371,7 +374,7 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
     process.on('SIGTERM', shutdown);
   }
 
-  return { server, config };
+  return { server, config, poller };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
