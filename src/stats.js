@@ -1,5 +1,5 @@
-import { getTrack } from './db.js';
 import { MOODS, moodColor } from './mood.js';
+import { playSource, playVersion, selectedPlayIds } from './play-query.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAY_SQL = "strftime('%Y-%m-%d', p.started_at / 1000, 'unixepoch', 'localtime')";
@@ -15,35 +15,70 @@ export function rangeBounds(range = 'week', now = Date.now()) {
   return { from: now - 7 * DAY_MS, to: now };
 }
 
-function playFilter({ from, to, deviceId }, alias = 'p') {
-  const clauses = [`${alias}.started_at >= ?`, `${alias}.started_at <= ?`];
-  const params = [from ?? 0, to ?? Date.now()];
-  if (deviceId) {
-    clauses.push(`${alias}.device_id = ?`);
-    params.push(deviceId);
-  }
-  return { sql: clauses.join(' AND '), params };
+const summaryCache = new WeakMap();
+
+function sumPlayedMs(db, ids) {
+  if (!ids.length) return 0;
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(played_ms), 0) AS playedMs
+      FROM plays
+     WHERE id IN (SELECT value FROM json_each(?))
+  `).get(JSON.stringify(ids));
+  return row.playedMs ?? 0;
 }
 
+// Structural writes (new/ended plays, mood changes) invalidate the cache.
+// Plain played_ms ticks are refreshed from the cached play ids, so a poll every
+// few seconds does not rerun the full dedupe and aggregation.
 export function getSummary(db, options = {}) {
-  const { sql, params } = playFilter(options);
+  const key = [
+    Math.floor((options.to ?? Date.now()) / 60_000),
+    Math.floor((options.from ?? 0) / 60_000),
+    options.deviceId ?? '',
+    options.trackId ?? '',
+    playVersion(db),
+  ].join('|');
+  let cache = summaryCache.get(db);
+  if (!cache) {
+    cache = new Map();
+    summaryCache.set(db, cache);
+  }
+  let entry = cache.get(key);
+  if (!entry) {
+    entry = computeSummary(db, options);
+    cache.set(key, entry);
+    if (cache.size > 32) cache.delete(cache.keys().next().value);
+  }
+  entry.summary.totals.playedMs = sumPlayedMs(db, entry.ids);
+  return entry.summary;
+}
+
+// Play filtering and multiroom dedupe are shared with the recent-plays query.
+function computeSummary(db, options = {}) {
+  const ids = selectedPlayIds(db, options);
+  const { from, where, params } = playSource(options, ids);
+  // Device views intentionally skip dedupe; keep their exact id list so the
+  // cached played-time refresh still sums the same rows.
+  const playedIds = ids ?? db.prepare(`
+    SELECT p.id FROM ${from} WHERE ${where}
+  `).all(...params).map((row) => row.id);
   const totals = db.prepare(`
     SELECT COUNT(*) AS plays,
            COUNT(DISTINCT p.track_id) AS uniqueTracks,
            COALESCE(SUM(p.played_ms), 0) AS playedMs,
            COUNT(DISTINCT ${DAY_SQL}) AS activeDays
-      FROM plays p
-     WHERE ${sql}
+      FROM ${from}
+     WHERE ${where}
   `).get(...params);
 
   const topTracks = db.prepare(`
     SELECT t.id, t.title, t.artist, t.album, m.mood,
            CASE WHEN t.art_uri IS NULL OR t.art_uri = '' THEN 0 ELSE 1 END AS hasArt,
            COUNT(*) AS plays, COALESCE(SUM(p.played_ms), 0) AS playedMs
-      FROM plays p
+      FROM ${from}
       JOIN tracks t ON t.id = p.track_id
       LEFT JOIN track_mood m ON m.track_id = t.id
-     WHERE ${sql}
+     WHERE ${where}
      GROUP BY t.id
      ORDER BY plays DESC, playedMs DESC
      LIMIT 20
@@ -53,9 +88,9 @@ export function getSummary(db, options = {}) {
     SELECT COALESCE(NULLIF(TRIM(t.artist), ''), 'Unknown') AS artist,
            COUNT(*) AS plays,
            COUNT(DISTINCT t.id) AS tracks
-      FROM plays p
+      FROM ${from}
       JOIN tracks t ON t.id = p.track_id
-     WHERE ${sql}
+     WHERE ${where}
      GROUP BY artist
      ORDER BY plays DESC, tracks DESC
      LIMIT 8
@@ -65,46 +100,39 @@ export function getSummary(db, options = {}) {
     SELECT COALESCE(m.mood, 'unknown') AS mood,
            COUNT(*) AS plays,
            COALESCE(SUM(p.played_ms), 0) AS playedMs
-      FROM plays p
+      FROM ${from}
       JOIN tracks t ON t.id = p.track_id
       LEFT JOIN track_mood m ON m.track_id = t.id
-     WHERE ${sql}
+     WHERE ${where}
      GROUP BY mood
      ORDER BY plays DESC
   `).all(...params);
 
-  const sources = db.prepare(`
-    SELECT COALESCE(p.source, 'unknown') AS source, COUNT(*) AS plays
-      FROM plays p
-     WHERE ${sql}
-     GROUP BY source
-     ORDER BY plays DESC
-  `).all(...params);
-
+  const timelineParams = [...params, ...params, ...params];
   const timeline = db.prepare(`
     WITH day_counts AS (
       SELECT ${DAY_SQL} AS day,
              COUNT(*) AS plays,
              COALESCE(SUM(p.played_ms), 0) AS playedMs
-        FROM plays p
-       WHERE ${sql}
+        FROM ${from}
+       WHERE ${where}
        GROUP BY day
     ), day_moods AS (
       SELECT ${DAY_SQL} AS day,
-             COALESCE(m.mood, 'unknown') AS mood,
+             m.mood AS mood,
              COUNT(*) AS moodPlays
-        FROM plays p
+        FROM ${from}
         JOIN tracks t ON t.id = p.track_id
-        LEFT JOIN track_mood m ON m.track_id = t.id
-       WHERE ${sql}
+        JOIN track_mood m ON m.track_id = t.id
+       WHERE ${where} AND m.mood IS NOT NULL
        GROUP BY day, mood
     ), day_tracks AS (
       SELECT ${DAY_SQL} AS day,
              t.id AS trackId,
              COUNT(*) AS trackPlays
-        FROM plays p
+        FROM ${from}
         JOIN tracks t ON t.id = p.track_id
-       WHERE ${sql}
+       WHERE ${where}
        GROUP BY day, t.id
     ), ranked AS (
       SELECT day, mood,
@@ -128,45 +156,25 @@ export function getSummary(db, options = {}) {
       LEFT JOIN ranked r ON r.day = d.day AND r.rn = 1
       LEFT JOIN ranked_tracks rt ON rt.day = d.day AND rt.rn = 1
      ORDER BY d.day
-  `).all(...params, ...params, ...params).map((row) => ({
+  `).all(...timelineParams).map((row) => ({
     ...row,
     color: moodColor(row.mood),
   }));
 
   return {
-    totals: {
-      plays: totals.plays ?? 0,
-      uniqueTracks: totals.uniqueTracks ?? 0,
-      playedMs: totals.playedMs ?? 0,
-      activeDays: totals.activeDays ?? 0,
+    ids: playedIds,
+    summary: {
+      totals: {
+        plays: totals.plays ?? 0,
+        uniqueTracks: totals.uniqueTracks ?? 0,
+        playedMs: totals.playedMs ?? 0,
+        activeDays: totals.activeDays ?? 0,
+      },
+      topTracks,
+      topArtists,
+      moods,
+      timeline,
     },
-    topTracks,
-    topArtists,
-    moods,
-    sources,
-    timeline,
-  };
-}
-
-export function getTrackDetails(db, trackId) {
-  const track = getTrack(db, trackId);
-  if (!track) return null;
-  const totals = db.prepare(`
-    SELECT COUNT(*) AS plays, COALESCE(SUM(played_ms), 0) AS playedMs, MAX(started_at) AS lastPlayedAt
-      FROM plays WHERE track_id = ?
-  `).get(trackId);
-  const tags = db.prepare(`
-    SELECT source, tag, weight FROM track_tags WHERE track_id = ? ORDER BY weight DESC, tag
-  `).all(trackId);
-  const moodRow = db.prepare('SELECT mood, scores, source, fetched_at FROM track_mood WHERE track_id = ?').get(trackId);
-  return {
-    track,
-    totals: { plays: totals.plays ?? 0, playedMs: totals.playedMs ?? 0, lastPlayedAt: totals.lastPlayedAt ?? null },
-    tags,
-    mood: moodRow?.mood ?? null,
-    scores: moodRow?.scores ? JSON.parse(moodRow.scores) : {},
-    source: moodRow?.source ?? null,
-    fetchedAt: moodRow?.fetched_at ?? null,
   };
 }
 

@@ -6,23 +6,69 @@ import { fileURLToPath } from 'node:url';
 import { createArtService } from './art.js';
 import { defaultConfigPath, loadConfig, saveConfig } from './config.js';
 import { backfillLocalMoods, endPlay, getRecentPlays, mergeDuplicatePlays, openDb, removeShortPlays } from './db.js';
-import { discoverWiimDevices, parseSubnet } from './discover.js';
+import { discoverWiimDevices, isAllowedDiscoverySubnet } from './discover.js';
 import { Enricher } from './enrichment.js';
-import { getMeta, getSummary, getTrackDetails, rangeBounds } from './stats.js';
+import { getMeta, getSummary, rangeBounds } from './stats.js';
 import { PlayTracker } from './play-detector.js';
 import { Poller } from './poller.js';
 import { clamp, deviceIdForHost } from './util.js';
+import { configureWiimTls } from './wiim.js';
 
-const webDir = fileURLToPath(new URL('./web/', import.meta.url));
+const webDir = fs.realpathSync(fileURLToPath(new URL('./web/', import.meta.url)));
 const startedAt = Date.now();
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+const DISCOVERY_COOLDOWN_MS = 10_000;
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
 };
+export const RETIRED_PAGES = new Set([
+  '/calm', '/calm/', '/calm.html', '/calm.css', '/calm.js',
+  '/light', '/light/', '/light.html', '/light.css',
+  '/notes', '/notes/', '/notes.html', '/notes.css',
+  '/minimal', '/minimal/', '/minimal.html', '/minimal.css',
+]);
+
+class RequestError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function hostnameOf(authority) {
+  try {
+    return new URL(`http://${authority}`).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isTrustedHost(hostname, config) {
+  if (LOOPBACK_HOSTS.has(hostname)) return true;
+  const bound = hostnameOf(String(config.host ?? ''));
+  // A wildcard bind can still be reached by its LAN IP, but not by a DNS name
+  // that an outside page could rebind to that IP.
+  if (['0.0.0.0', '::'].includes(bound)) return isAllowedDiscoverySubnet(hostname);
+  return Boolean(bound) && hostname === bound;
+}
+
+function isTrustedApiRequest(req, config) {
+  const hostname = hostnameOf(req.headers.host ?? 'localhost');
+  if (!isTrustedHost(hostname, config)) return false;
+  if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    return isTrustedHost(parsed.hostname, config)
+      && parsed.host.toLowerCase() === String(req.headers.host ?? '').toLowerCase();
+  } catch {
+    return false;
+  }
+}
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
@@ -30,7 +76,6 @@ function sendJson(res, status, payload) {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
   });
   res.end(body);
 }
@@ -40,38 +85,88 @@ function parseQuery(req) {
 }
 
 async function readJson(req) {
+  const contentType = String(req.headers['content-type'] ?? '').toLowerCase();
+  if (!contentType.includes('application/json')) {
+    throw new RequestError(400, 'Expected application/json');
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 16 * 1024) throw new Error('Request body too large');
+    if (size > 16 * 1024) throw new RequestError(400, 'Request body too large');
     chunks.push(chunk);
   }
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
   } catch {
-    throw new Error('Invalid JSON body');
+    throw new RequestError(400, 'Invalid JSON body');
   }
 }
 
 function serveStatic(res, pathname) {
-  const requested = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+  if (RETIRED_PAGES.has(pathname)) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
+    return;
+  }
+  let requested;
+  try {
+    requested = pathname === '/' ? 'index.html'
+      : decodeURIComponent(pathname).replace(/^\/+/, '');
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain' }).end('Bad request');
+    return;
+  }
   const filePath = path.resolve(webDir, requested);
-  if (!filePath.startsWith(webDir)) {
+  if (filePath !== webDir && !filePath.startsWith(webDir + path.sep)) {
     res.writeHead(403).end('Forbidden');
     return;
   }
   let target = filePath;
-  if (!fs.existsSync(target) && !path.extname(target)) target = path.join(webDir, 'index.html');
-  if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+  let stat;
+  try {
+    stat = fs.statSync(target);
+    if (!stat.isFile()) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
+      return;
+    }
+  } catch {
+    if (path.extname(target)) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
+      return;
+    }
+    target = path.join(webDir, 'index.html');
+    try {
+      stat = fs.statSync(target);
+    } catch {
+      res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
+      return;
+    }
+    if (!stat.isFile()) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
+      return;
+    }
+  }
+  let realTarget;
+  try {
+    realTarget = fs.realpathSync(target);
+  } catch {
     res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
     return;
   }
+  if (realTarget !== webDir && !realTarget.startsWith(webDir + path.sep)) {
+    res.writeHead(403).end('Forbidden');
+    return;
+  }
   res.writeHead(200, {
-    'Content-Type': MIME[path.extname(target)] ?? 'application/octet-stream',
+    'Content-Type': MIME[path.extname(realTarget)] ?? 'application/octet-stream',
     'Cache-Control': 'no-cache',
   });
-  fs.createReadStream(target).pipe(res);
+  const stream = fs.createReadStream(realTarget);
+  stream.on('error', () => {
+    if (res.headersSent) res.destroy();
+    else res.writeHead(500, { 'Content-Type': 'text/plain' }).end('Internal server error');
+  });
+  stream.pipe(res);
 }
 
 function sendArt(res, load, errorMessage) {
@@ -109,8 +204,14 @@ function defaultRestart() {
   process.exit(0);
 }
 
-export async function startServer({ configPath = defaultConfigPath(), restart = defaultRestart } = {}) {
+export async function startServer({
+  configPath = defaultConfigPath(),
+  restart = defaultRestart,
+  discoverDevices = discoverWiimDevices,
+  discoveryCooldownMs = DISCOVERY_COOLDOWN_MS,
+} = {}) {
   const config = loadConfig({ configPath });
+  configureWiimTls(config);
   const db = openDb(config.dataDir);
   const art = createArtService(db, config.dataDir);
   const enricher = new Enricher(db, config);
@@ -121,12 +222,19 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
   });
   const poller = new Poller({ config, db, tracker });
   let wiping = false;
+  let discovering = false;
+  let lastDiscoveryAt = 0;
 
   const server = http.createServer(async (req, res) => {
     const url = parseQuery(req);
     const route = url.pathname;
 
     try {
+      if (route.startsWith('/api/') && !isTrustedApiRequest(req, config)) {
+        sendJson(res, 403, { error: 'Forbidden' });
+        return;
+      }
+
       if (route === '/api/health') {
         sendJson(res, 200, {
           ok: true,
@@ -162,7 +270,7 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
           host,
         };
         poller.addDevice(device);
-        saveConfig(config);
+        saveConfig(config, configPath);
         console.log(`[devices] added ${device.name} (${device.host})`);
         sendJson(res, 201, { added: true, device });
         return;
@@ -176,7 +284,7 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
           sendJson(res, 404, { error: 'Device is not configured' });
           return;
         }
-        saveConfig(config);
+        saveConfig(config, configPath);
         console.log(`[devices] removed ${device.name} (${device.host})`);
         sendJson(res, 200, { removed: true, device });
         return;
@@ -189,19 +297,43 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
 
       if (route === '/api/discover') {
         const subnet = url.searchParams.get('subnet');
-        if (subnet && !parseSubnet(subnet)) {
-          sendJson(res, 400, { error: 'Invalid subnet; use a /24 network' });
+        if (subnet && !isAllowedDiscoverySubnet(subnet)) {
+          sendJson(res, 400, { error: 'Invalid subnet; use a private /24 network' });
           return;
         }
-        const devices = await discoverWiimDevices({
-          subnets: subnet ? [subnet] : undefined,
-          timeoutMs: 2000,
-          requestTimeoutMs: 800,
-        });
-        sendJson(res, 200, {
-          devices,
-          configured: config.devices.map((device) => device.host),
-        });
+        if (discovering) {
+          sendJson(res, 409, { error: 'Discovery is already running' });
+          return;
+        }
+        const now = Date.now();
+        if (now - lastDiscoveryAt < discoveryCooldownMs) {
+          sendJson(res, 429, { error: 'Discovery was just run; please wait a moment' });
+          return;
+        }
+        discovering = true;
+        lastDiscoveryAt = now;
+        try {
+          let scanned = 0;
+          let total = 0;
+          const devices = await discoverDevices({
+            subnets: subnet ? [subnet] : undefined,
+            timeoutMs: 2000,
+            requestTimeoutMs: 800,
+            onProgress: (event) => {
+              if (event.method !== 'scan') return;
+              scanned = event.scanned ?? scanned;
+              total = event.total ?? total;
+            },
+          });
+          sendJson(res, 200, {
+            devices,
+            configured: config.devices.map((device) => device.host),
+            scanned,
+            total,
+          });
+        } finally {
+          discovering = false;
+        }
         return;
       }
 
@@ -268,17 +400,6 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
         return;
       }
 
-      if (route.startsWith('/api/tracks/')) {
-        const id = route.slice('/api/tracks/'.length);
-        const details = getTrackDetails(db, id);
-        if (!details) {
-          sendJson(res, 404, { error: 'Track not found' });
-          return;
-        }
-        sendJson(res, 200, details);
-        return;
-      }
-
       if (route === '/api/data' && req.method === 'DELETE') {
         const body = await readJson(req);
         if (body.confirm !== 'DELETE ALL DATA') {
@@ -290,11 +411,8 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
           return;
         }
         wiping = true;
-        poller.stop();
-        sendJson(res, 200, { deleted: true, restarting: true });
-        // Give the response time to reach the browser, then wipe and restart
-        // in a fresh process so no stale in-memory play/art state survives.
-        setTimeout(() => {
+        await poller.stop();
+        try {
           try {
             db.close();
           } catch {
@@ -304,6 +422,16 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
             fs.rmSync(path.join(config.dataDir, `melune.db${suffix}`), { force: true });
           }
           fs.rmSync(path.join(config.dataDir, 'art'), { recursive: true, force: true });
+        } catch (error) {
+          wiping = false;
+          console.error('[data] deletion failed:', error.message);
+          sendJson(res, 500, { error: 'Could not delete data' });
+          return;
+        }
+        sendJson(res, 200, { deleted: true, restarting: true });
+        // Restart after the response flushes, in a fresh process so no stale
+        // in-memory play/art state survives.
+        setTimeout(() => {
           let restarted = false;
           const doRestart = () => {
             if (restarted) return;
@@ -313,7 +441,7 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
           server.close(doRestart);
           server.closeAllConnections?.();
           setTimeout(() => { if (!restarted) doRestart(); }, 3000).unref();
-        }, 500);
+        }, 250);
         return;
       }
 
@@ -324,11 +452,15 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
 
       serveStatic(res, route);
     } catch (error) {
+      if (error instanceof RequestError) {
+        sendJson(res, error.status, { error: error.message });
+        return;
+      }
       console.error('[http]', error);
       if (res.headersSent) {
         res.end();
       } else {
-        sendJson(res, 500, { error: 'Internal server error', message: error.message });
+        sendJson(res, 500, { error: 'Internal server error' });
       }
     }
   });
@@ -358,8 +490,11 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
   if (backfilled) console.log(`enriching ${backfilled} previously seen tracks with MusicBrainz tags`);
   poller.start();
 
-  const shutdown = () => {
-    poller.stop();
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await poller.stop();
     for (const row of db.prepare('SELECT id FROM plays WHERE ended_at IS NULL').all()) {
       endPlay(db, row.id, Date.now());
     }
@@ -370,8 +505,8 @@ export async function startServer({ configPath = defaultConfigPath(), restart = 
     setTimeout(() => process.exit(0), 2000).unref();
   };
   if (restart === defaultRestart) {
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', () => void shutdown());
+    process.on('SIGTERM', () => void shutdown());
   }
 
   return { server, config, poller };

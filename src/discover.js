@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
-import { deviceInfoFromStatus, getStatusEx } from './wiim.js';
+import { configureWiimTls, deviceInfoFromStatus, getStatusEx } from './wiim.js';
 
 const SEARCH = Buffer.from(
   [
@@ -22,6 +22,13 @@ const PRIVATE_V4 = [
   /^172\.(?:1[6-9]|2\d|3[01])\./,
   /^192\.168\./,
 ];
+const ALLOWED_SCAN_V4 = [...PRIVATE_V4, /^169\.254\./];
+
+/** Only local/LAN ranges may be scanned through the API or CLI. */
+export function isAllowedDiscoverySubnet(value) {
+  const parsed = parseSubnet(value);
+  return Boolean(parsed && ALLOWED_SCAN_V4.some((pattern) => pattern.test(parsed.base)));
+}
 
 function ipToInt(ip) {
   const parts = String(ip).split('.').map(Number);
@@ -61,7 +68,7 @@ export function hostsFor(subnet) {
 }
 
 /** Detect private /24 networks on the local machine. */
-export function localSubnets() {
+function localSubnets() {
   const found = new Set();
   for (const addresses of Object.values(os.networkInterfaces())) {
     for (const address of addresses ?? []) {
@@ -146,17 +153,28 @@ function cliSubnets() {
 export async function discoverWiimDevices(options = {}) {
   const opts = typeof options === 'number' ? { timeoutMs: options } : options;
   const config = loadConfig({ createIfMissing: false });
+  configureWiimTls(config);
   const timeoutMs = opts.timeoutMs ?? 3000;
   const requestTimeoutMs = opts.requestTimeoutMs ?? Math.min(1000, config.requestTimeoutMs);
   const concurrency = opts.concurrency ?? 16;
-  const subnets = opts.subnets ?? cliSubnets();
+  const subnets = opts.subnets === undefined ? cliSubnets() : [].concat(opts.subnets);
+  if (!subnets.every(isAllowedDiscoverySubnet)) {
+    throw new Error('Refusing to scan a subnet outside local/LAN ranges');
+  }
   const check = (host) => validate(host, requestTimeoutMs);
 
   const ssdpHosts = await ssdpSearch(timeoutMs);
   const ssdpDevices = (await Promise.all(ssdpHosts.map(check))).filter(Boolean);
   opts.onProgress?.({ method: 'ssdp', found: ssdpDevices.length });
 
-  const hosts = [...new Set(subnets.flatMap((subnet) => hostsFor(subnet)))];
+  // SSDP often finds every device on a home LAN. Scan only the subnets those
+  // devices are on instead of every local interface; full scans remain the
+  // fallback when multicast is blocked.
+  const ssdpSubnets = [...new Set(ssdpDevices
+    .map((device) => parseSubnet(device.host)?.base)
+    .filter(Boolean))];
+  const scanSubnets = ssdpSubnets.length && opts.scanAllAfterSsdp !== true ? ssdpSubnets : subnets;
+  const hosts = [...new Set(scanSubnets.flatMap((subnet) => hostsFor(subnet)))];
   let scanned = 0;
   const scannedDevices = await mapWithConcurrency(hosts, async (host) => {
     const device = await check(host);
@@ -179,27 +197,32 @@ async function main() {
   console.log('Searching for WiiM devices on the local network...');
 
   let lastPercent = -1;
-  const devices = await discoverWiimDevices({
-    subnets,
-    onProgress: (event) => {
-      if (event.method !== 'scan' || !event.total) return;
-      const percent = Math.floor((event.scanned / event.total) * 100);
-      if (percent < lastPercent + 20 && percent !== 100) return;
-      lastPercent = percent;
-      console.log(`  scanned ${event.scanned}/${event.total} hosts`);
-    },
-  });
+  try {
+    const devices = await discoverWiimDevices({
+      subnets,
+      onProgress: (event) => {
+        if (event.method !== 'scan' || !event.total) return;
+        const percent = Math.floor((event.scanned / event.total) * 100);
+        if (percent < lastPercent + 20 && percent !== 100) return;
+        lastPercent = percent;
+        console.log(`  scanned ${event.scanned}/${event.total} hosts`);
+      },
+    });
 
-  if (devices.length === 0) {
-    console.log('No devices found. You can set the IP manually in config.json.');
-    return;
+    if (devices.length === 0) {
+      console.log('No devices found. You can set the IP manually in config.json.');
+      return;
+    }
+    console.log('Found:');
+    for (const device of devices) {
+      console.log(`  ${device.host}  ${device.name ?? 'WiiM'}  ${device.model ?? ''}`.trimEnd());
+    }
+    console.log('\nAdd entries like this to config.json:');
+    console.log(JSON.stringify(devices.map(({ host, name }) => ({ name: name || host, host })), null, 2));
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
   }
-  console.log('Found:');
-  for (const device of devices) {
-    console.log(`  ${device.host}  ${device.name ?? 'WiiM'}  ${device.model ?? ''}`.trimEnd());
-  }
-  console.log('\nAdd entries like this to config.json:');
-  console.log(JSON.stringify(devices.map(({ host, name }) => ({ name: name || host, host })), null, 2));
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

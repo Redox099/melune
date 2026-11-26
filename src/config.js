@@ -9,6 +9,10 @@ const DEFAULTS = {
   pollIntervalMs: 5000,
   requestTimeoutMs: 2500,
   minPlayMs: 30_000,
+  // WiiM devices usually use self-signed certificates. Keep verification off
+  // by default, but allow a CA file / strict mode for hardened networks.
+  tlsRejectUnauthorized: false,
+  tlsCaFile: null,
   devices: [],
 };
 
@@ -36,6 +40,12 @@ export function loadConfig({ configPath = defaultConfigPath(), createIfMissing =
   };
 
   config.port = Number(process.env.MELUNE_PORT || config.port);
+  if (process.env.MELUNE_TLS_REJECT_UNAUTHORIZED !== undefined) {
+    config.tlsRejectUnauthorized = /^(1|true|yes|on)$/i.test(process.env.MELUNE_TLS_REJECT_UNAUTHORIZED);
+  }
+  if (process.env.MELUNE_TLS_CA_FILE) config.tlsCaFile = process.env.MELUNE_TLS_CA_FILE;
+  config.tlsRejectUnauthorized = Boolean(config.tlsRejectUnauthorized);
+  config.tlsCaFile = config.tlsCaFile ? String(config.tlsCaFile) : null;
 
   config.dataDir = path.resolve(process.cwd(), config.dataDir);
   config.devices = (config.devices ?? [])
@@ -61,6 +71,8 @@ export function saveConfig(config, configPath = defaultConfigPath()) {
     pollIntervalMs: config.pollIntervalMs,
     requestTimeoutMs: config.requestTimeoutMs,
     minPlayMs: config.minPlayMs,
+    tlsRejectUnauthorized: config.tlsRejectUnauthorized,
+    tlsCaFile: config.tlsCaFile,
     devices: (config.devices ?? []).map(({ name, host }) => ({ name, host })),
   };
   fs.writeFileSync(configPath, `${JSON.stringify(safe, null, 2)}\n`);

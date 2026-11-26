@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
 import https from 'node:https';
 import { promisify } from 'node:util';
 import { cleanMeta, toInt } from './util.js';
@@ -14,11 +15,42 @@ const CONNECT_ERRORS = new Set([
   'ETIMEDOUT',
 ]);
 
+let tlsOptions = { rejectUnauthorized: false, caFile: null };
+let caCache = { path: null, data: undefined };
+
+/** WiiM devices commonly use self-signed certs; strict mode is opt-in. */
+export function configureWiimTls(config = {}) {
+  tlsOptions = {
+    rejectUnauthorized: config.tlsRejectUnauthorized === undefined
+      ? tlsOptions.rejectUnauthorized
+      : Boolean(config.tlsRejectUnauthorized),
+    caFile: config.tlsCaFile ? String(config.tlsCaFile) : null,
+  };
+  caCache = { path: null, data: undefined };
+}
+
+export function wiimTlsOptions() {
+  return { ...tlsOptions };
+}
+
+function caContents() {
+  if (!tlsOptions.caFile) return undefined;
+  if (caCache.path === tlsOptions.caFile) return caCache.data;
+  const data = fs.readFileSync(tlsOptions.caFile);
+  caCache = { path: tlsOptions.caFile, data };
+  return data;
+}
+
 function nativeHttpsText(url, timeoutMs) {
   return new Promise((resolve, reject) => {
     const req = https.get(
       url,
-      { rejectUnauthorized: false, timeout: timeoutMs, headers: { Connection: 'close' } },
+      {
+        rejectUnauthorized: tlsOptions.rejectUnauthorized,
+        ca: caContents(),
+        timeout: timeoutMs,
+        headers: { Connection: 'close' },
+      },
       (res) => {
         const chunks = [];
         res.on('data', (chunk) => chunks.push(chunk));
@@ -47,16 +79,19 @@ function nativeHttpsText(url, timeoutMs) {
  * fallback for connection-level failures.
  */
 async function curlText(url, timeoutMs) {
+  const args = [];
+  if (!tlsOptions.rejectUnauthorized) args.push('--insecure');
+  if (tlsOptions.caFile) args.push('--cacert', tlsOptions.caFile);
+  args.push(
+    '--silent',
+    '--show-error',
+    '--max-time',
+    String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+    url.toString(),
+  );
   const { stdout } = await execFileAsync(
     'curl',
-    [
-      '--insecure',
-      '--silent',
-      '--show-error',
-      '--max-time',
-      String(Math.max(1, Math.ceil(timeoutMs / 1000))),
-      url.toString(),
-    ],
+    args,
     { timeout: timeoutMs + 1000, maxBuffer: 2 * 1024 * 1024 },
   );
   return stdout;
@@ -93,7 +128,7 @@ function parseWiiM(text) {
   }
 }
 
-export async function callDevice(host, command, { timeoutMs = 2500 } = {}) {
+async function callDevice(host, command, { timeoutMs = 2500 } = {}) {
   const url = new URL(`https://${host}/httpapi.asp`);
   url.searchParams.set('command', command);
   return parseWiiM(await httpsText(url, { timeoutMs }));
@@ -103,11 +138,11 @@ export async function getStatusEx(host, options) {
   return callDevice(host, 'getStatusEx', options);
 }
 
-export async function getPlayerStatus(host, options) {
+async function getPlayerStatus(host, options) {
   return callDevice(host, 'getPlayerStatus', options);
 }
 
-export async function getMetaInfo(host, options) {
+async function getMetaInfo(host, options) {
   return callDevice(host, 'getMetaInfo', options);
 }
 
@@ -174,11 +209,7 @@ export function normalizeObservation(player = {}, meta = {}, at = Date.now()) {
     source: sourceName(p.mode, p.vendor),
     positionMs: toInt(p.curpos ?? p.offset_pts),
     durationMs: toInt(p.totlen),
-    plicurr: toInt(p.plicurr),
-    plicount: toInt(p.plicount),
     track,
-    sampleRate: metaData.sampleRate ?? null,
-    bitDepth: metaData.bitDepth ?? null,
   };
 }
 

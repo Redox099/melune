@@ -29,7 +29,10 @@ export class PlayTracker {
     this.db = db;
     this.onPlayStarted = onPlayStarted;
     this.minPlayMs = Math.max(0, minPlayMs);
-    this.maxTickMs = Math.max(pollIntervalMs * 2, 15_000);
+    this.maxTickMs = Math.max(pollIntervalMs * 3, 30_000);
+    // Playback position is a better clock when a poll arrives late; tolerating
+    // a larger jump here avoids treating a real seek as listening time.
+    this.maxPositionDeltaMs = Math.max(this.maxTickMs, pollIntervalMs * 6);
     this.gapThresholdMs = Math.max(pollIntervalMs * 4, 60_000);
     this.resumeGapMs = MERGE_GAP_MS;
     this.states = new Map();
@@ -73,11 +76,14 @@ export class PlayTracker {
     const active = ACTIVE_STATES.has(observation.status);
     const stopped = STOPPED_STATES.has(observation.status);
     const state = { ...(this.states.get(deviceId) ?? {}) };
+    const hasTrackMetadata = hasMetadata(track);
     const trackId = fingerprint(track);
-    const stateKey = hasMetadata(track) ? trackId : `${trackId}:${source}`;
+    const stateKey = hasTrackMetadata ? trackId : `${trackId}:${source}`;
     // Persist metadata even when the player is stopped/paused so the UI can show
-    // artwork for the track the device is still reporting.
-    const persistedTrackId = hasMetadata(track) ? getOrCreateTrack(this.db, track) : null;
+    // artwork for the track the device is still reporting. Active playback with
+    // blank metadata still needs a real row: plays.track_id is NOT NULL, and
+    // getOrCreateTrack stores it as "Unknown track".
+    const persistedTrackId = hasTrackMetadata || active ? getOrCreateTrack(this.db, track) : null;
 
     let reason = null;
     if (active) {
@@ -152,7 +158,13 @@ export class PlayTracker {
       }
     } else if (active && state.playId) {
       if (state.lastTick) {
-        const delta = Math.min(at - state.lastTick, this.maxTickMs);
+        const wallDelta = at - state.lastTick;
+        const positionDelta = positionMs !== null && state.lastPosition !== null
+          ? positionMs - state.lastPosition
+          : null;
+        const delta = positionDelta !== null && positionDelta > 0 && positionDelta <= this.maxPositionDeltaMs
+          ? positionDelta
+          : Math.min(wallDelta, this.maxTickMs);
         updatePlayTick(this.db, state.playId, delta, positionMs);
       }
       // After a pause or a merged stop, the first playing poll re-establishes the clock.
@@ -197,7 +209,7 @@ export class PlayTracker {
       track: state.track ?? null,
       reason: state.key ? 'playing' : 'idle',
       openPlays: getOpenPlay(this.db, deviceId)?.id ?? null,
-      startedCount: state.startedCount ?? this.startedCount,
+      startedCount: this.startedCount,
     };
   }
 }

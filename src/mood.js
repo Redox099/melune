@@ -1,6 +1,6 @@
 import { normalizeText } from './util.js';
 
-export const NO_MOOD_COLOR = '#6b7280';
+const NO_MOOD_COLOR = '#6b7280';
 
 export const MOODS = {
   happy: { label: 'Happy', color: '#d97706' },
@@ -60,10 +60,6 @@ export function scoreMood(tags = [], { wordBoundaries = false } = {}) {
 
   const mood = ranked[0] && ranked[0][1] >= 0.2 ? ranked[0][0] : null;
   return { mood, scores: Object.fromEntries(ranked) };
-}
-
-export function moodLabel(mood) {
-  return MOODS[mood]?.label ?? (mood ? String(mood) : 'Unknown');
 }
 
 export function moodColor(mood) {

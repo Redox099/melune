@@ -2,9 +2,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { localMood, localMoodTags } from './mood.js';
+import { playFilter, playVersion, selectedPlayIds } from './play-query.js';
 import { fingerprint, normalizeText } from './util.js';
 
 export const MERGE_GAP_MS = 10 * 60 * 1000;
+const recentCache = new WeakMap();
+
+// played_ms changes every poll, but it is the only volatile field. Refresh it
+// in place so the cached rows still avoid a full dedupe on each request.
+function refreshPlayDurations(db, rows) {
+  if (!rows.length) return;
+  const ids = JSON.stringify(rows.map((row) => row.id));
+  const current = new Map(db.prepare(`
+    SELECT id, played_ms FROM plays WHERE id IN (SELECT value FROM json_each(?))
+  `).all(ids).map((row) => [row.id, row.played_ms]));
+  for (const row of rows) row.played_ms = current.get(row.id) ?? row.played_ms;
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -76,6 +89,35 @@ CREATE TABLE IF NOT EXISTS artist_images (
   image_url TEXT,
   fetched_at INTEGER NOT NULL
 );
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('play_version', '0');
+
+CREATE TRIGGER IF NOT EXISTS plays_version_insert AFTER INSERT ON plays BEGIN
+  UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'play_version';
+END;
+-- played_ms ticks are refreshed from the cache, so only identity, timing and
+-- grouping columns invalidate aggregates.
+CREATE TRIGGER IF NOT EXISTS plays_version_update AFTER UPDATE OF
+  device_id, track_id, started_at, ended_at, source, position_start_ms, position_end_ms
+  ON plays
+BEGIN
+  UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'play_version';
+END;
+CREATE TRIGGER IF NOT EXISTS plays_version_delete AFTER DELETE ON plays BEGIN
+  UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'play_version';
+END;
+CREATE TRIGGER IF NOT EXISTS track_mood_version_insert AFTER INSERT ON track_mood BEGIN
+  UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'play_version';
+END;
+CREATE TRIGGER IF NOT EXISTS track_mood_version_update AFTER UPDATE ON track_mood BEGIN
+  UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'play_version';
+END;
+CREATE TRIGGER IF NOT EXISTS track_mood_version_delete AFTER DELETE ON track_mood BEGIN
+  UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'play_version';
+END;
+CREATE TRIGGER IF NOT EXISTS tracks_version_update AFTER UPDATE ON tracks BEGIN
+  UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'play_version';
+END;
 `;
 
 export function openDb(dataDir) {
@@ -83,6 +125,17 @@ export function openDb(dataDir) {
   const db = new DatabaseSync(path.join(dataDir, 'melune.db'));
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA);
+  // Databases created before version triggers existed need a starting value
+  // that reflects their existing rows.
+  db.exec(`
+    UPDATE meta
+       SET value = CAST(MAX(
+         CAST(value AS INTEGER),
+         (SELECT COUNT(*) FROM plays),
+         (SELECT COUNT(*) FROM track_mood)
+       ) AS TEXT)
+     WHERE key = 'play_version'
+  `);
   if (!db.prepare('PRAGMA table_info(track_mood)').all().some((column) => column.name === 'source')) {
     db.exec("ALTER TABLE track_mood ADD COLUMN source TEXT NOT NULL DEFAULT 'musicbrainz'");
     db.exec("UPDATE track_mood SET source = 'local' WHERE mood IS NULL");
@@ -248,20 +301,21 @@ export function getTrackMood(db, trackId) {
   return db.prepare('SELECT mood FROM track_mood WHERE track_id = ?').get(trackId)?.mood ?? null;
 }
 
-export function getTracksForEnrichment(db, limit = 100) {
+export function getTracksForEnrichment(db, limit = 100, before = 0) {
   return db.prepare(`
     SELECT t.id, t.title, t.artist, t.album, t.art_uri
       FROM tracks t
       LEFT JOIN track_mood m ON m.track_id = t.id
      WHERE (m.track_id IS NULL OR m.mood IS NULL OR m.source = 'local')
+       AND COALESCE(m.fetched_at, 0) <= ?
        AND COALESCE(t.title, '') <> ''
        AND COALESCE(t.artist, '') <> ''
      ORDER BY t.updated_at DESC
      LIMIT ?
-  `).all(limit);
+  `).all(before, limit);
 }
 
-export function getTracksForLocalMood(db, limit = 500) {
+function getTracksForLocalMood(db, limit = 500) {
   return db.prepare(`
     SELECT t.id, t.title, t.artist, t.album
       FROM tracks t
@@ -292,9 +346,7 @@ export function upsertTrackTags(db, trackId, tags, source, fetchedAt = Date.now(
   }
 }
 
-export function setTrackMood(db, trackId, mood, scores, options = {}) {
-  const { fetchedAt = Date.now(), source = 'musicbrainz' } =
-    typeof options === 'number' ? { fetchedAt: options } : options;
+export function setTrackMood(db, trackId, mood, scores, { fetchedAt = Date.now(), source = 'musicbrainz' } = {}) {
   const existing = db.prepare('SELECT source, mood FROM track_mood WHERE track_id = ?').get(trackId);
   // A local guess must never replace a mood inferred from real MusicBrainz tags.
   if (source === 'local' && existing?.source === 'musicbrainz' && existing.mood) return false;
@@ -309,7 +361,7 @@ export function setTrackMood(db, trackId, mood, scores, options = {}) {
   return true;
 }
 
-export function artistKey(artist) {
+function artistKey(artist) {
   return normalizeText(artist) || 'unknown';
 }
 
@@ -334,14 +386,33 @@ export function setArtistImage(db, artist, imageUrl, fetchedAt = Date.now()) {
 }
 
 export function getRecentPlays(db, { from = 0, to = Date.now(), deviceId = null, limit = 50 } = {}) {
-  const clauses = ['p.started_at >= ?', 'p.started_at <= ?'];
-  const params = [from, to];
-  if (deviceId) {
-    clauses.push('p.device_id = ?');
-    params.push(deviceId);
+  const key = [
+    Math.floor(to / 60_000),
+    Math.floor(from / 60_000),
+    deviceId ?? '',
+    limit,
+    playVersion(db),
+  ].join('|');
+  let cache = recentCache.get(db);
+  if (!cache) {
+    cache = new Map();
+    recentCache.set(db, cache);
+  }
+  const cached = cache.get(key);
+  if (cached) {
+    refreshPlayDurations(db, cached);
+    return cached;
+  }
+
+  const { sql, params } = playFilter({ from, to, deviceId });
+  const ids = selectedPlayIds(db, { from, to, deviceId });
+  let where = sql;
+  if (ids) {
+    where += ' AND p.id IN (SELECT value FROM json_each(?))';
+    params.push(JSON.stringify(ids));
   }
   params.push(limit);
-  return db.prepare(`
+  const rows = db.prepare(`
     SELECT p.id, p.started_at, p.ended_at, p.played_ms, p.source,
            t.id AS track_id, t.title, t.artist, t.album,
            CASE WHEN t.art_uri IS NULL OR t.art_uri = '' THEN 0 ELSE 1 END AS hasArt,
@@ -351,10 +422,13 @@ export function getRecentPlays(db, { from = 0, to = Date.now(), deviceId = null,
       JOIN tracks t ON t.id = p.track_id
       JOIN devices d ON d.id = p.device_id
       LEFT JOIN track_mood m ON m.track_id = t.id
-     WHERE ${clauses.join(' AND ')}
+     WHERE ${where}
      ORDER BY p.started_at DESC
      LIMIT ?
   `).all(...params);
+  cache.set(key, rows);
+  if (cache.size > 32) cache.delete(cache.keys().next().value);
+  return rows;
 }
 
 /**

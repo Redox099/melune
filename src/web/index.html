@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#0a0b0c" />
+  <meta name="theme-color" content="#181a1e" />
   <title>melune — listening history</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -42,7 +42,6 @@
             <span>Device</span>
             <select id="device-select"><option value="">All devices</option></select>
           </label>
-          <span class="control-divider" aria-hidden="true"></span>
           <button type="button" class="discover-button" id="discover-button">Devices</button>
         </div>
       </section>
@@ -58,12 +57,12 @@
       </section>
 
       <div class="columns">
-        <section class="card">
+        <section class="card most-played-card">
           <div class="section-head"><h2>Most played tracks</h2></div>
           <ol class="rank-list" id="top-tracks"></ol>
         </section>
         <div class="stack">
-          <section class="card">
+          <section class="card mood-mix-card">
             <div class="section-head"><h2>Mood mix</h2></div>
             <div class="mood-list" id="moods"></div>
           </section>
@@ -74,12 +73,12 @@
         </div>
       </div>
 
-      <section class="card">
+      <section class="card activity-card">
         <div class="section-head"><h2>Activity</h2></div>
         <div class="timeline" id="timeline"></div>
       </section>
 
-      <section class="card">
+      <section class="card recent-plays-card">
         <div class="section-head"><h2>Recent plays</h2></div>
         <div class="table-wrap">
           <table>
@@ -97,11 +96,11 @@
     </footer>
   </div>
 
-  <dialog class="discover-dialog" id="discover-dialog">
+  <dialog class="discover-dialog" id="discover-dialog" aria-labelledby="discover-title" aria-describedby="discover-description">
     <form method="dialog" class="discover-head">
       <div>
-        <h2>Devices</h2>
-        <p>Scan the local network and add devices to melune.</p>
+        <h2 id="discover-title">Devices</h2>
+        <p id="discover-description">Scan the local network and add devices to melune.</p>
       </div>
       <button type="submit" class="discover-close" aria-label="Close">×</button>
     </form>
@@ -112,11 +111,11 @@
     <div class="discover-results" id="discover-results"></div>
   </dialog>
 
-  <dialog class="discover-dialog" id="delete-dialog">
+  <dialog class="discover-dialog" id="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
     <form method="dialog" class="discover-head">
       <div>
-        <h2>Delete all data?</h2>
-        <p>This permanently removes all listening history and cached art. Your devices stay configured.</p>
+        <h2 id="delete-title">Delete all data?</h2>
+        <p id="delete-description">This permanently removes all listening history and cached art. Your devices stay configured.</p>
       </div>
       <button type="submit" class="discover-close" aria-label="Close">×</button>
     </form>

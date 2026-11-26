@@ -7,12 +7,13 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { createArtService, detectImageType } from '../src/art.js';
-import { hostsFor, parseSubnet } from '../src/discover.js';
+import { hostsFor, isAllowedDiscoverySubnet, parseSubnet } from '../src/discover.js';
 import {
   endPlay,
   getArtistImage,
   getOpenPlay,
   getOrCreateTrack,
+  getRecentPlays,
   mergeDuplicatePlays,
   openDb,
   removeShortPlays,
@@ -25,11 +26,42 @@ import {
 import { Enricher } from '../src/enrichment.js';
 import { localMood, moodColor, scoreMood } from '../src/mood.js';
 import { PlayTracker } from '../src/play-detector.js';
+import { dedupePlayRows } from '../src/play-dedupe.js';
 import { Poller } from '../src/poller.js';
-import { startServer } from '../src/server.js';
+import { RETIRED_PAGES, startServer } from '../src/server.js';
 import { getSummary, rangeBounds } from '../src/stats.js';
 import { cleanMeta, decodeMaybeHex, deviceIdForHost, fingerprint } from '../src/util.js';
-import { normalizeObservation, sourceName } from '../src/wiim.js';
+import { configureWiimTls, normalizeObservation, sourceName, wiimTlsOptions } from '../src/wiim.js';
+
+async function withTestServer(dir, options, run) {
+  const configPath = path.join(dir, 'config.json');
+  fs.writeFileSync(configPath, `${JSON.stringify({
+    host: '127.0.0.1',
+    port: 0,
+    dataDir: dir,
+    devices: [],
+    pollIntervalMs: 1000,
+    requestTimeoutMs: 500,
+    minPlayMs: 0,
+  }, null, 2)}\n`);
+  const previousPort = process.env.MELUNE_PORT;
+  delete process.env.MELUNE_PORT;
+  let server;
+  let poller;
+  try {
+    ({ server, poller } = await startServer({ configPath, restart: () => {}, ...options }));
+    await run(`http://127.0.0.1:${server.address().port}`);
+  } finally {
+    if (previousPort === undefined) delete process.env.MELUNE_PORT;
+    else process.env.MELUNE_PORT = previousPort;
+    poller?.stop();
+    if (server?.listening) {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 test('subnet helpers expand a LAN range', () => {
   assert.deepEqual(parseSubnet('192.168.2.0/24'), {
@@ -43,6 +75,13 @@ test('subnet helpers expand a LAN range', () => {
   assert.equal(hosts.length, 254);
   assert.equal(hosts[0], '192.168.2.1');
   assert.equal(hosts.at(-1), '192.168.2.254');
+
+  assert.equal(isAllowedDiscoverySubnet('10.0.0.0/24'), true);
+  assert.equal(isAllowedDiscoverySubnet('192.168.2.135'), true);
+  assert.equal(isAllowedDiscoverySubnet('169.254.1.0/24'), true);
+  assert.equal(isAllowedDiscoverySubnet('8.8.8.0/24'), false);
+  assert.equal(isAllowedDiscoverySubnet('172.32.0.0/24'), false);
+  assert.equal(isAllowedDiscoverySubnet('nope'), false);
 });
 
 test('hex metadata is decoded only when it round-trips', () => {
@@ -227,6 +266,46 @@ test('enrichment needs no API key and skips empty tracks', () => {
   }
 });
 
+test('enrichment backs off retries and caps its queue and seen set', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-enrich-limits-'));
+  try {
+    const db = openDb(dir);
+    const enricher = new Enricher(db);
+    // Keep this test about admission control, not network calls.
+    enricher.drain = async () => {};
+    const track = { artist: 'Artist', title: 'Track' };
+
+    assert.equal(enricher.enqueue(track), true);
+    assert.equal(enricher.enqueue(track), false);
+    enricher.queue.length = 0;
+    assert.equal(enricher.enqueue(track), false);
+    assert.equal(enricher.stats.backedOff, 1);
+
+    for (let index = 0; index < 60; index += 1) {
+      enricher.enqueue({ artist: 'Artist', title: `Track ${index}` });
+    }
+    assert.equal(enricher.queue.length, 50);
+    assert.equal(enricher.stats.dropped, 10);
+    assert.ok(enricher.attempts.size <= 500);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('WiiM TLS verification can be enabled with a custom CA', () => {
+  try {
+    configureWiimTls({ tlsRejectUnauthorized: true, tlsCaFile: '/tmp/melune-ca.pem' });
+    assert.deepEqual(wiimTlsOptions(), {
+      rejectUnauthorized: true,
+      caFile: '/tmp/melune-ca.pem',
+    });
+  } finally {
+    configureWiimTls({ tlsRejectUnauthorized: false, tlsCaFile: null });
+  }
+  assert.deepEqual(wiimTlsOptions(), { rejectUnauthorized: false, caFile: null });
+});
+
 test('play tracking dedupes polls and ignores pause time', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-track-'));
   try {
@@ -269,6 +348,72 @@ test('play tracking dedupes polls and ignores pause time', () => {
   }
 });
 
+test('playback with blank metadata records an Unknown track instead of failing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-unknown-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const started = [];
+    const tracker = new PlayTracker(db, {
+      pollIntervalMs: 5000,
+      minPlayMs: 0,
+      onPlayStarted: (play) => started.push(play),
+    });
+    const observe = (at, status, positionMs) => tracker.observe('d1', {
+      at,
+      status,
+      source: 'wiim',
+      positionMs,
+      track: {},
+    });
+
+    observe(1000, 'play', 0);
+    observe(6000, 'play', 5000);
+    observe(11_000, 'stop', 5000);
+
+    const plays = db.prepare(`
+      SELECT p.*, t.title FROM plays p JOIN tracks t ON t.id = p.track_id
+    `).all();
+    assert.equal(plays.length, 1);
+    assert.equal(plays[0].title, 'Unknown track');
+    assert.equal(plays[0].played_ms, 5000);
+    assert.equal(started.length, 1);
+    assert.ok(started[0].trackId);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('delayed polls use playback position instead of a short wall-clock cap', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-tick-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const tracker = new PlayTracker(db, { pollIntervalMs: 5000, minPlayMs: 0 });
+    const observe = (at, track, positionMs, status = 'play') => tracker.observe('d1', {
+      at, status, source: 'wiim', positionMs, track,
+    });
+    const one = { title: 'One', artist: 'Artist' };
+    const two = { title: 'Two', artist: 'Artist' };
+
+    observe(1000, one, 0);
+    observe(31_000, one, 30_000);
+    observe(32_000, one, 30_000, 'stop');
+    observe(33_000, two, 0);
+    observe(43_000, two, 200_000);
+    observe(44_000, two, 200_000, 'stop');
+
+    const plays = db.prepare('SELECT * FROM plays ORDER BY id').all();
+    assert.equal(plays.length, 2);
+    assert.equal(plays[0].played_ms, 30_000);
+    assert.equal(plays[1].played_ms, 10_000);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('stats aggregate plays from SQLite', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-stats-'));
   try {
@@ -293,6 +438,128 @@ test('stats aggregate plays from SQLite', () => {
   }
 });
 
+test('summary cache invalidates when plays change', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-cache-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    const trackId = getOrCreateTrack(db, { title: 'One', artist: 'Artist' });
+    const options = { from: 0, to: 120_000 };
+
+    const first = startPlay(db, {
+      deviceId: 'd1', trackId, startedAt: 1000, source: 'wiim', positionStartMs: 0,
+    });
+    updatePlayTick(db, first, 10_000, 10_000);
+    endPlay(db, first, 11_000, 10_000);
+    assert.equal(getSummary(db, options).totals.plays, 1);
+
+    const second = startPlay(db, {
+      deviceId: 'd1', trackId, startedAt: 20_000, source: 'wiim', positionStartMs: 0,
+    });
+    updatePlayTick(db, second, 10_000, 10_000);
+    endPlay(db, second, 31_000, 10_000);
+    assert.equal(getSummary(db, options).totals.plays, 2);
+
+    // Plain played_ms ticks do not invalidate the structural cache; both
+    // aggregates and recent rows still report the new duration.
+    const beforeMs = getSummary(db, options).totals.playedMs;
+    const beforeRows = getRecentPlays(db, { from: 0, to: 120_000 });
+    const beforeRowMs = beforeRows.find((row) => row.id === second).played_ms;
+    db.prepare('UPDATE plays SET played_ms = played_ms + 5000 WHERE id = ?').run(second);
+    assert.equal(getSummary(db, options).totals.playedMs, beforeMs + 5000);
+    assert.equal(getSummary(db, options).totals.plays, 2);
+    const afterRows = getRecentPlays(db, { from: 0, to: 120_000 });
+    assert.equal(afterRows.find((row) => row.id === second).played_ms, 15_000);
+    assert.equal(beforeRowMs, 10_000);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('multiroom plays with the same start and finish count once across devices', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-multiroom-'));
+  try {
+    const db = openDb(dir);
+    upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
+    upsertDevice(db, { id: 'd2', name: 'Kitchen', host: '192.168.1.51' }, {}, 1000);
+    upsertDevice(db, { id: 'd3', name: 'Studio', host: '192.168.1.52' }, {}, 1000);
+    const trackId = getOrCreateTrack(db, { title: 'One', artist: 'Artist' });
+
+    for (const deviceId of ['d1', 'd2']) {
+      const playId = startPlay(db, {
+        deviceId, trackId, startedAt: 1000, source: 'wiim', positionStartMs: 0,
+      });
+      updatePlayTick(db, playId, 60_000, 60_000);
+      endPlay(db, playId, 61_000, 60_000);
+    }
+
+    const summary = getSummary(db, { from: 0, to: 120_000 });
+    assert.equal(summary.totals.plays, 1);
+    assert.equal(summary.totals.playedMs, 60_000);
+    assert.equal(summary.totals.uniqueTracks, 1);
+    assert.equal(summary.topTracks[0].plays, 1);
+    assert.equal(summary.timeline[0].plays, 1);
+    assert.equal(getSummary(db, { from: 0, to: 120_000, deviceId: 'd1' }).totals.plays, 1);
+    assert.equal(getSummary(db, { from: 0, to: 120_000, deviceId: 'd2' }).totals.plays, 1);
+    assert.equal(getRecentPlays(db, { from: 0, to: 120_000 }).length, 1);
+    assert.equal(getRecentPlays(db, { from: 0, to: 120_000, deviceId: 'd2' }).length, 1);
+
+    const lateDevice = startPlay(db, {
+      deviceId: 'd3', trackId, startedAt: 6000, source: 'wiim', positionStartMs: 5000,
+    });
+    updatePlayTick(db, lateDevice, 55_000, 65_000);
+    endPlay(db, lateDevice, 65_000, 65_000);
+    assert.equal(getSummary(db, { from: 0, to: 120_000 }).totals.plays, 1);
+
+    const laterPlay = startPlay(db, {
+      deviceId: 'd1', trackId, startedAt: 120_000, source: 'wiim', positionStartMs: 0,
+    });
+    updatePlayTick(db, laterPlay, 30_000, 30_000);
+    endPlay(db, laterPlay, 151_000, 30_000);
+    assert.equal(getSummary(db, { from: 0, to: 200_000 }).totals.plays, 2);
+    assert.equal(getRecentPlays(db, { from: 0, to: 200_000 }).length, 2);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('play dedupe keeps the longest play and breaks ties by id', () => {
+  const rows = [
+    { id: 9, device_id: 'a', track_id: 't1', started_at: 1000, ended_at: 2000, played_ms: 1000 },
+    { id: 4, device_id: 'b', track_id: 't1', started_at: 1000, ended_at: 2000, played_ms: 1000 },
+    { id: 5, device_id: 'c', track_id: 't1', started_at: 1000, ended_at: 2000, played_ms: 1500 },
+    { id: 7, device_id: 'd', track_id: 't1', started_at: 3000, ended_at: 3500, played_ms: 500 },
+    { id: 3, device_id: 'e', track_id: 't1', started_at: 3000, ended_at: 3500, played_ms: 500 },
+    { id: 8, device_id: 'f', track_id: 't1', started_at: 5000, ended_at: null, played_ms: 100 },
+    { id: 2, device_id: 'a', track_id: 't2', started_at: 1000, ended_at: 2000, played_ms: 1000 },
+  ];
+  assert.deepEqual(dedupePlayRows(rows), [2, 3, 5, 8]);
+});
+
+test('play dedupe groups staggered multiroom plays but preserves distinct sources', () => {
+  const rows = [
+    {
+      id: 1, device_id: 'a', track_id: 't1', started_at: 1000, ended_at: 61_000,
+      played_ms: 60_000, source: 'wiim', position_start_ms: 0, position_end_ms: 60_000,
+    },
+    {
+      id: 2, device_id: 'b', track_id: 't1', started_at: 6000, ended_at: 65_000,
+      played_ms: 55_000, source: 'wiim', position_start_ms: 5000, position_end_ms: 65_000,
+    },
+    {
+      id: 3, device_id: 'a', track_id: 't1', started_at: 120_000, ended_at: 150_000,
+      played_ms: 30_000, source: 'wiim', position_start_ms: 0, position_end_ms: 30_000,
+    },
+    {
+      id: 4, device_id: 'b', track_id: 't1', started_at: 126_000, ended_at: 156_000,
+      played_ms: 30_000, source: 'airplay', position_start_ms: 0, position_end_ms: 30_000,
+    },
+  ];
+  assert.deepEqual(dedupePlayRows(rows), [1, 3, 4]);
+});
+
 test('timeline reports the dominant mood for each day', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-timeline-'));
   try {
@@ -300,17 +567,22 @@ test('timeline reports the dominant mood for each day', () => {
     upsertDevice(db, { id: 'd1', name: 'Living Room', host: '192.168.1.50' }, {}, 1000);
     const calm = getOrCreateTrack(db, { title: 'Calm', artist: 'Artist' });
     const sad = getOrCreateTrack(db, { title: 'Sad', artist: 'Artist' });
+    const untagged = getOrCreateTrack(db, { title: 'Untagged', artist: 'Artist' });
     setTrackMood(db, calm, 'calm', {});
     setTrackMood(db, sad, 'sad', {});
-    for (const [trackId, at] of [[calm, 1000], [calm, 20_000], [sad, 40_000]]) {
+    for (const [trackId, at] of [
+      [calm, 1000], [calm, 20_000], [sad, 40_000],
+      [untagged, 50_000], [untagged, 60_000], [untagged, 70_000],
+      [untagged, 80_000], [untagged, 90_000],
+    ]) {
       const playId = startPlay(db, { deviceId: 'd1', trackId, startedAt: at, source: 'wiim' });
       updatePlayTick(db, playId, 5000, 5000);
       endPlay(db, playId, at + 6000, 5000);
     }
 
-    const summary = getSummary(db, { from: 0, to: 60_000 });
+    const summary = getSummary(db, { from: 0, to: 120_000 });
     assert.equal(summary.timeline.length, 1);
-    assert.equal(summary.timeline[0].plays, 3);
+    assert.equal(summary.timeline[0].plays, 8);
     assert.equal(summary.timeline[0].mood, 'calm');
     db.close();
   } finally {
@@ -414,7 +686,9 @@ test('a brief stop and resume of the same track counts as one play', () => {
     const plays = db.prepare('SELECT * FROM plays ORDER BY id').all();
     assert.equal(plays.length, 1);
     assert.equal(plays[0].ended_at, null);
-    assert.equal(plays[0].played_ms, 15_000);
+    // The device reports position 7s -> 9s across the brief stop, so that
+    // interval was real playback rather than paused time.
+    assert.equal(plays[0].played_ms, 17_000);
     assert.equal(plays[0].position_start_ms, 0);
     assert.ok(plays[0].position_end_ms >= 19_000);
     db.close();
@@ -504,7 +778,8 @@ test('an open play survives a tracker restart', () => {
 
     const plays = db.prepare('SELECT * FROM plays ORDER BY id').all();
     assert.equal(plays.length, 1);
-    assert.equal(plays[0].played_ms, 15_000);
+    // Position advances 15s across the restart, so the full interval counts.
+    assert.equal(plays[0].played_ms, 20_000);
     assert.equal(plays[0].ended_at, null);
     db.close();
   } finally {
@@ -774,6 +1049,128 @@ test('a second instance fails before touching the database', async () => {
     const mood = check.prepare('SELECT mood FROM track_mood WHERE track_id = ?').get(trackId);
     assert.equal(mood.mood, null);
     check.close();
+  } finally {
+    if (previousPort === undefined) delete process.env.MELUNE_PORT;
+    else process.env.MELUNE_PORT = previousPort;
+    poller?.stop();
+    if (server?.listening) await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('API has no wildcard CORS and rejects unsafe mutation requests', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-origin-'));
+  await withTestServer(dir, {}, async (base) => {
+    const meta = await fetch(`${base}/api/meta`);
+    assert.equal(meta.status, 200);
+    assert.equal(meta.headers.get('access-control-allow-origin'), null);
+
+    const crossOrigin = await fetch(`${base}/api/devices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+      body: JSON.stringify({ host: '192.168.1.99' }),
+    });
+    assert.equal(crossOrigin.status, 403);
+
+    const crossSite = await fetch(`${base}/api/devices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'cross-site' },
+      body: JSON.stringify({ host: '192.168.1.99' }),
+    });
+    assert.equal(crossSite.status, 403);
+
+    const wrongType = await fetch(`${base}/api/devices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ host: '192.168.1.99' }),
+    });
+    assert.equal(wrongType.status, 400);
+    assert.match((await wrongType.json()).error, /application\/json/);
+
+    const added = await fetch(`${base}/api/devices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host: '192.168.1.99', name: 'Office' }),
+    });
+    assert.equal(added.status, 201);
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+    assert.deepEqual(saved.devices.map((device) => device.host), ['192.168.1.99']);
+  });
+});
+
+test('static paths reject malformed escapes and traversal', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-static-'));
+  await withTestServer(dir, {}, async (base) => {
+    const [malformed, traversal, fallback, asset] = await Promise.all([
+      fetch(`${base}/%E0%A4%A`),
+      fetch(`${base}/%2e%2e%2fserver.js`),
+      fetch(`${base}/not-a-real-page`),
+      fetch(`${base}/music-note.svg`),
+    ]);
+    assert.equal(malformed.status, 400);
+    assert.equal(traversal.status, 403);
+    assert.equal(fallback.status, 200);
+    assert.match(await fallback.text(), /id="kpis"/);
+    assert.equal(asset.status, 200);
+  });
+});
+
+test('discovery rejects public subnets and throttles repeated scans', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-discover-'));
+  const calls = [];
+  await withTestServer(dir, {
+    discoveryCooldownMs: 100,
+    discoverDevices: async (options) => {
+      calls.push(options);
+      return [];
+    },
+  }, async (base) => {
+    const publicSubnet = await fetch(`${base}/api/discover?subnet=8.8.8.0%2F24`);
+    assert.equal(publicSubnet.status, 400);
+
+    const invalid = await fetch(`${base}/api/discover?subnet=not-a-subnet`);
+    assert.equal(invalid.status, 400);
+
+    const first = await fetch(`${base}/api/discover?subnet=192.168.1.0%2F24`);
+    assert.equal(first.status, 200);
+    assert.deepEqual((await first.json()).devices, []);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].subnets, ['192.168.1.0/24']);
+
+    const second = await fetch(`${base}/api/discover?subnet=192.168.1.0%2F24`);
+    assert.equal(second.status, 429);
+    assert.equal(calls.length, 1);
+  });
+});
+
+test('alternate views are retired', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-single-page-'));
+  const configPath = path.join(dir, 'config.json');
+  fs.writeFileSync(configPath, `${JSON.stringify({
+    host: '127.0.0.1', port: 0, dataDir: dir, devices: [],
+  }, null, 2)}\n`);
+  const previousPort = process.env.MELUNE_PORT;
+  delete process.env.MELUNE_PORT;
+  let server;
+  let poller;
+  try {
+    ({ server, poller } = await startServer({ configPath, restart: () => {} }));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const retiredRoutes = [...RETIRED_PAGES];
+    const [dashboard, fallbackIcon, ...retired] = await Promise.all([
+      fetch(`${base}/`),
+      fetch(`${base}/music-note.svg`),
+      ...retiredRoutes.map((route) => fetch(`${base}${route}`)),
+    ]);
+    assert.equal(dashboard.status, 200);
+    assert.equal(fallbackIcon.status, 200);
+    const dashboardHtml = await dashboard.text();
+    assert.match(dashboardHtml, /id="kpis"/);
+    assert.equal((dashboardHtml.match(/href="\/styles\.css"/g) ?? []).length, 1);
+    assert.equal((dashboardHtml.match(/src="\/app\.js"/g) ?? []).length, 1);
+    retired.forEach((response, index) => {
+      assert.equal(response.status, 404, `${retiredRoutes[index]} should be retired`);
+    });
   } finally {
     if (previousPort === undefined) delete process.env.MELUNE_PORT;
     else process.env.MELUNE_PORT = previousPort;

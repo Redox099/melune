@@ -3,6 +3,11 @@ import { localMood, scoreMood } from './mood.js';
 import { fingerprint, sleep } from './util.js';
 
 const RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+const MAX_QUEUE = 50;
+const MAX_SEEN = 500;
+const BACKOFF_BASE_MS = 60_000;
+const BACKOFF_MAX_MS = RETRY_AFTER_MS;
+const BACKOFF_JITTER_MS = 15_000;
 const MB_API_ROOT = 'https://musicbrainz.org/ws/2/';
 const MB_USER_AGENT = 'melune/0.1.0 ( https://github.com/redox/melune )';
 // MusicBrainz allows one request per second per source IP. Leave a little room.
@@ -68,6 +73,11 @@ function hasMood(tags) {
   return Boolean(scoreMood(tags).mood);
 }
 
+function retryBackoffMs(attempt) {
+  const base = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, attempt - 1));
+  return base + Math.floor(Math.random() * BACKOFF_JITTER_MS);
+}
+
 /**
  * Metadata enrichment from MusicBrainz tags and genres. Everything is
  * best-effort: playback recording never depends on it.
@@ -79,10 +89,11 @@ export class Enricher {
     this.queue = [];
     this.processing = false;
     this.seen = new Map();
+    this.attempts = new Map();
     this.lastMbRequestAt = 0;
     this.fetch = fetch;
     this.sleep = sleep;
-    this.stats = { enriched: 0, failed: 0, skipped: 0 };
+    this.stats = { enriched: 0, failed: 0, skipped: 0, dropped: 0, backedOff: 0 };
   }
 
   get configured() {
@@ -92,21 +103,35 @@ export class Enricher {
   enqueue(track) {
     if (!track?.artist && !track?.title && !track?.album) {
       this.stats.skipped += 1;
-      return;
+      return false;
     }
     const id = fingerprint(track);
-    const lastSeen = this.seen.get(id);
-    if (lastSeen && Date.now() - lastSeen < RETRY_AFTER_MS) return;
-    this.seen.set(id, Date.now());
+    const now = Date.now();
+    if (this.queue.some((item) => item.id === id)) return false;
+    const attempt = this.attempts.get(id) ?? { at: 0, count: 0 };
+    if (now - attempt.at < retryBackoffMs(attempt.count)) {
+      this.stats.backedOff += 1;
+      return false;
+    }
+    while (this.queue.length >= MAX_QUEUE) {
+      this.queue.shift();
+      this.stats.dropped += 1;
+    }
+    this.attempts.set(id, { at: now, count: attempt.count + 1 });
+    this.seen.delete(id);
+    this.seen.set(id, now);
+    while (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.keys().next().value);
     this.queue.push({ ...track, id });
     void this.drain();
+    return true;
   }
 
   /** Queue already-seen tracks so history is enriched on startup. */
   backfill(limit = 100) {
-    const tracks = getTracksForEnrichment(this.db, limit);
-    for (const track of tracks) this.enqueue(track);
-    return tracks.length;
+    const tracks = getTracksForEnrichment(this.db, limit, Date.now() - RETRY_AFTER_MS);
+    let queued = 0;
+    for (const track of tracks) if (this.enqueue(track)) queued += 1;
+    return queued;
   }
 
   async drain() {
@@ -142,6 +167,7 @@ export class Enricher {
     setTrackMood(this.db, trackId, mood, scores, {
       source: inferred.mood ? 'musicbrainz' : 'local',
     });
+    if (inferred.mood) this.attempts.delete(track.id ?? fingerprint(track));
     return { mood, scores, tags };
   }
 

@@ -1,5 +1,8 @@
 const state = { range: 'today', device: '', moods: {} };
 const MOOD_FALLBACK = '#6b7280';
+const ARTIST_LIMIT = 7;
+const DISCOVERY_COOLDOWN_MS = 10_000;
+let lastDiscoveryAt = 0;
 let configuredHosts = new Set();
 let configuredDevices = [];
 let discoveredDevices = [];
@@ -11,7 +14,7 @@ const $ = (selector) => document.querySelector(selector);
 const painted = new Map();
 const lastTrackIds = new Map();
 const moodTokens = new Map();
-const MOOD_VARS = ['--mood-color', '--mood-border', '--mood-soft', '--mood-glow'];
+const MOOD_VARS = ['--mood-color', '--mood-soft'];
 function paint(key, value, draw) {
   const signature = JSON.stringify(value);
   if (painted.get(key) === signature) return false;
@@ -55,23 +58,6 @@ function moodColor(mood, fallback) {
   return state.moods?.[mood]?.color ?? fallback ?? MOOD_FALLBACK;
 }
 
-function playingMoods() {
-  const active = new Set();
-  for (const device of configuredDevices) {
-    const current = device.current;
-    if (current && ['play', 'loading'].includes(current.status)
-      && current.mood && current.mood !== 'unknown') active.add(current.mood);
-  }
-  return active;
-}
-
-function updateMoodGlow() {
-  const active = playingMoods();
-  for (const row of document.querySelectorAll('#moods .mood-row[data-mood]')) {
-    row.classList.toggle('playing', active.has(row.dataset.mood));
-  }
-}
-
 function colorRgba(color, alpha) {
   const hex = String(color ?? MOOD_FALLBACK).replace('#', '');
   const safe = /^[\da-f]{6}$/i.test(hex) ? hex : MOOD_FALLBACK.slice(1);
@@ -81,25 +67,25 @@ function colorRgba(color, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-function moodRgba(mood, alpha, fallback) {
-  return colorRgba(moodColor(mood, fallback), alpha);
-}
-
 function empty(message) {
   return `<div class="empty">${esc(message)}</div>`;
 }
 
-function cover(trackId, hasArt, modifier = '') {
+function coverMarkup(src, modifier = '') {
   const extra = modifier ? ` ${modifier}` : '';
-  const image = trackId && hasArt
-    ? `<img src="/api/art/${encodeURIComponent(trackId)}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true">`
+  const image = src
+    ? `<img src="${src}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true">`
     : '';
-  return `<span class="cover${extra}" aria-hidden="true"><span class="cover-mark">♪</span>${image}</span>`;
+  return `<span class="cover${extra}" aria-hidden="true"><span class="cover-mark"></span>${image}</span>`;
+}
+
+function cover(trackId, hasArt, modifier = '') {
+  const src = trackId && hasArt ? `/api/art/${encodeURIComponent(trackId)}` : '';
+  return coverMarkup(src, modifier);
 }
 
 function artistCover(artist) {
-  const src = `/api/artist-art/${encodeURIComponent(artist || '')}`;
-  return `<span class="cover cover-artist" aria-hidden="true"><span class="cover-mark">♪</span><img src="${src}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true"></span>`;
+  return coverMarkup(`/api/artist-art/${encodeURIComponent(artist || '')}`, 'cover-artist');
 }
 
 async function api(path, options = {}) {
@@ -155,7 +141,6 @@ function renderDevices(devices) {
   configuredHosts = new Set(devices.map((device) => device.host));
   configuredDevices = devices;
   renderNow(devices);
-  updateMoodGlow();
 }
 
 function moodVars(mood, colorByMood, fallbackColor) {
@@ -164,9 +149,7 @@ function moodVars(mood, colorByMood, fallbackColor) {
   if (!color) return {};
   return {
     '--mood-color': color,
-    '--mood-border': colorRgba(color, 0.24),
     '--mood-soft': colorRgba(color, 0.1),
-    '--mood-glow': colorRgba(color, 0.85),
   };
 }
 
@@ -193,18 +176,21 @@ function nowCard(device) {
     .join('');
   return { playing, status, title, artist, progress, showProgress, mood, fallbackColor,
     html: `<article class="now-card ${playing ? 'playing' : ''}" style="${moodVar}">
-      <div class="now-top">
-        <span class="device-name">${esc(device.name)}</span>
-        <span class="state-pill ${playing ? 'playing' : ''}">${esc(status)}</span>
-      </div>
       <div class="now-main">
         ${cover(current?.trackId, current?.hasArt, 'cover-lg')}
         <div class="now-copy">
+          <div class="now-top">
+            <span class="device-label">
+              <span class="device-name">${esc(device.name)}</span>
+              <span class="level-meter" aria-hidden="true"><i></i><i></i><i></i></span>
+            </span>
+            <span class="state-pill">${esc(status)}</span>
+          </div>
           <div class="now-title" title="${esc(title)}">${esc(title)}</div>
           <div class="now-artist" title="${esc(artist)}">${esc(artist)}</div>
+          <div class="progress"><span ${showProgress ? '' : 'hidden'} style="width:${progress.toFixed(1)}%"></span></div>
         </div>
       </div>
-      <div class="progress"><span ${showProgress ? '' : 'hidden'} style="width:${progress.toFixed(1)}%"></span></div>
     </article>` };
 }
 
@@ -214,22 +200,12 @@ function progressFor(current) {
   return length > 0 ? Math.min(100, (position / length) * 100) : 0;
 }
 
-// Spread device cards across as few rows as possible (max 3 per row), with
-// each row sharing the width evenly. Every card gets its flex basis so rows
-// with fewer cards still fill the full width.
-function layoutNowGrid(grid) {
-  const cards = [...grid.querySelectorAll('.now-card')];
-  const count = cards.length;
-  if (!count) return;
-  const rows = Math.ceil(count / 3);
-  const perRow = Math.floor(count / rows);
-  const extra = count % rows;
-  let index = 0;
-  for (let row = 0; row < rows; row += 1) {
-    const cols = perRow + (row < extra ? 1 : 0);
-    const basis = cols === 1 ? '100%' : `calc((100% - ${(cols - 1) * 12}px) / ${cols})`;
-    for (let i = 0; i < cols && index < count; i += 1, index += 1) {
-      cards[index].style.setProperty('--card-basis', basis);
+// Independent small jumps read as a level meter rather than a repeating wave.
+function animateLevelMeters() {
+  if (document.hidden || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  for (const meter of document.querySelectorAll('.now-card.playing .level-meter')) {
+    for (const bar of meter.children) {
+      bar.style.height = `${Math.round(35 + Math.random() * 55)}%`;
     }
   }
 }
@@ -284,7 +260,6 @@ function renderNow(devices) {
     }
     card.classList.toggle('playing', view.playing);
     const pill = card.querySelector('.state-pill');
-    pill.classList.toggle('playing', view.playing);
     if (pill.textContent !== view.status) pill.textContent = view.status;
     const token = (moodTokens.get(device.id) ?? 0) + 1;
     moodTokens.set(device.id, token);
@@ -323,7 +298,6 @@ function renderNow(devices) {
       moodTokens.delete(id);
     }
   }
-  layoutNowGrid(grid);
 }
 
 function renderKpis(data) {
@@ -340,9 +314,7 @@ function renderTracks(tracks) {
     target.innerHTML = empty('No plays yet. Start playing music on a WiiM device.');
     return;
   }
-  const max = Math.max(1, ...tracks.map((track) => track.plays));
   target.innerHTML = tracks.map((track) => {
-    const width = Math.max(3, (track.plays / max) * 100);
     const subtitle = track.artist || 'Unknown artist';
     return `<li class="rank-item">
       ${cover(track.id, track.hasArt, 'cover-rank')}
@@ -350,7 +322,6 @@ function renderTracks(tracks) {
         <div class="rank-title" title="${esc(track.title)}">${esc(track.title || 'Unknown track')}</div>
         <div class="rank-sub">${esc(subtitle)}</div>
       </div>
-      <div class="bar"><span style="width:${width.toFixed(1)}%"></span></div>
       <div class="rank-value"><strong>${number(track.plays)}</strong></div>
     </li>`;
   }).join('');
@@ -367,11 +338,10 @@ function renderMoods(moods) {
   }
   const total = known.reduce((sum, row) => sum + row.plays, 0);
   const max = Math.max(1, ...known.map((row) => row.plays));
-  const active = playingMoods();
   target.innerHTML = known.map((row) => {
     const percent = total ? (row.plays / total) * 100 : 0;
     const width = Math.max(3, (row.plays / max) * 100);
-    return `<div class="mood-row ${active.has(row.mood) ? 'playing' : ''}" data-mood="${esc(row.mood)}" style="--bar-glow:${esc(moodRgba(row.mood, 0.85))}">
+    return `<div class="mood-row" data-mood="${esc(row.mood)}">
       <span class="mood-name">${esc(moodLabel(row.mood))}</span>
       <span class="bar"><span style="width:${width.toFixed(1)}%;background:${esc(moodColor(row.mood))}"></span></span>
       <span class="mood-value">${Math.round(percent)}%</span>
@@ -381,11 +351,12 @@ function renderMoods(moods) {
 
 function renderArtists(artists) {
   const target = $('#artists');
-  if (!artists?.length) {
+  const items = (artists ?? []).slice(0, ARTIST_LIMIT);
+  if (!items.length) {
     target.innerHTML = empty('No artists yet.');
     return;
   }
-  target.innerHTML = artists.map((artist) => `<div class="artist">
+  target.innerHTML = items.map((artist) => `<div class="artist">
     ${artistCover(artist.artist)}
     <div class="artist-copy">
       <strong title="${esc(artist.artist)}">${esc(artist.artist)}</strong>
@@ -440,7 +411,7 @@ function renderPlays(plays) {
     if (!row || row.dataset.signature !== signature) {
       const template = document.createElement('template');
       template.innerHTML = `<tr>
-        <td class="muted">${esc(relative(play.started_at))}</td>
+        <td class="muted when">${esc(relative(play.started_at))}</td>
         <td class="track-cell">
           <span class="track-cell-main">
             ${cover(play.track_id, play.hasArt, 'cover-row')}
@@ -461,6 +432,9 @@ function renderPlays(plays) {
     const cell = row.querySelector('.duration');
     const text = duration(play.played_ms);
     if (cell.textContent !== text) cell.textContent = text;
+    const when = row.querySelector('.when');
+    const whenText = relative(play.started_at);
+    if (when.textContent !== whenText) when.textContent = whenText;
     const targetIndex = [...target.children].indexOf(row);
     if (targetIndex !== index) target.insertBefore(row, target.children[index] || null);
   });
@@ -488,7 +462,8 @@ async function refresh() {
       () => renderTracks(data.topTracks ?? []));
     paint('moods', (data.moods ?? []).map((m) => [m.mood, m.plays]),
       () => renderMoods(data.moods ?? []));
-    paint('artists', data.topArtists ?? [], () => renderArtists(data.topArtists ?? []));
+    const topArtists = (data.topArtists ?? []).slice(0, ARTIST_LIMIT);
+    paint('artists', topArtists, () => renderArtists(topArtists));
     paint('timeline', data.timeline ?? [], () => renderTimeline(data.timeline ?? []));
   }
   if (plays.status === 'fulfilled') renderPlays(plays.value.plays ?? []);
@@ -554,6 +529,11 @@ async function runDiscovery() {
   const scan = $('#discover-scan');
   const dialog = $('#discover-dialog');
   if (!dialog.open) dialog.showModal();
+  if (Date.now() - lastDiscoveryAt < DISCOVERY_COOLDOWN_MS) {
+    discoveryStatus('Please wait a few seconds before scanning again.');
+    return;
+  }
+  lastDiscoveryAt = Date.now();
   $('#scan-spinner').hidden = false;
   if (configuredDevices.length) {
     renderDiscovery();
@@ -568,7 +548,8 @@ async function runDiscovery() {
     configuredHosts = new Set(result.configured ?? [...configuredHosts]);
     const devices = result.devices ?? [];
     renderDiscovery(devices);
-    discoveryStatus(`Found ${devices.length} device${devices.length === 1 ? '' : 's'}. Add the ones you want to track.`);
+    const scanDetail = result.total ? ` (scanned ${result.scanned}/${result.total} hosts)` : '';
+    discoveryStatus(`Found ${devices.length} device${devices.length === 1 ? '' : 's'}${scanDetail}. Add the ones you want to track.`);
   } catch (error) {
     discoveryStatus(`Discovery failed: ${error.message}`);
   } finally {
@@ -693,6 +674,8 @@ async function init() {
   }
   bind();
   await refresh();
+  animateLevelMeters();
+  setInterval(animateLevelMeters, 220);
   setInterval(() => void refresh(), 15_000);
 }
 

@@ -67,19 +67,6 @@ export function deviceIdForHost(host) {
   return createHash('sha256').update(String(host).trim().toLowerCase()).digest('hex').slice(0, 16);
 }
 
-export function formatDuration(ms) {
-  const totalSeconds = Math.max(0, Math.round(ms / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return `${totalSeconds}s`;
-}
-
-export function formatNumber(n) {
-  return new Intl.NumberFormat('en-US').format(n ?? 0);
-}
-
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

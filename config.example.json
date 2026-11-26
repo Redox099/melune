@@ -5,6 +5,8 @@
   "pollIntervalMs": 5000,
   "requestTimeoutMs": 2500,
   "minPlayMs": 30000,
+  "tlsRejectUnauthorized": false,
+  "tlsCaFile": null,
   "devices": [
     {
       "name": "Living Room",

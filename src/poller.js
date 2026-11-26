@@ -14,21 +14,33 @@ export class Poller {
     this.stopping = false;
     this.timer = null;
     this.ticks = 0;
+    this.inFlight = new Set();
+  }
+
+  track(task) {
+    const promise = Promise.resolve(task);
+    this.inFlight.add(promise);
+    promise.then(
+      () => this.inFlight.delete(promise),
+      () => this.inFlight.delete(promise),
+    );
+    return promise;
   }
 
   start() {
     if (this.running) return;
     this.stopping = false;
     this.running = true;
-    for (const device of this.config.devices) void this.refreshDeviceInfo(device);
-    void this.loop();
+    for (const device of this.config.devices) void this.track(this.refreshDeviceInfo(device));
+    void this.track(this.loop());
   }
 
-  stop() {
+  async stop() {
     this.running = false;
     this.stopping = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    await Promise.allSettled([...this.inFlight]);
   }
 
   async loop() {
@@ -88,8 +100,8 @@ export class Poller {
   addDevice(device) {
     if (this.config.devices.some((existing) => existing.host === device.host)) return false;
     this.config.devices.push(device);
-    void this.refreshDeviceInfo(device);
-    void this.pollDevice(device);
+    void this.track(this.refreshDeviceInfo(device));
+    void this.track(this.pollDevice(device));
     return true;
   }
 
