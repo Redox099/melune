@@ -1049,14 +1049,19 @@ footer::after {
 }
 
 @media (max-width: 640px) {
-  .app { padding: 20px 14px 32px; }
+  .app { padding: 16px 14px 28px; }
+
+  .topbar,
+  .controls,
+  .kpis,
+  .columns,
+  .card.activity-card,
+  footer { margin-left: 0; margin-right: 0; }
 
   .topbar {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 14px;
-    padding-bottom: 16px;
-    margin-bottom: 0;
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 14px;
   }
 
   .brand h1 { font-size: 18px; }
@@ -1067,25 +1072,45 @@ footer::after {
     flex-direction: column;
     align-items: stretch;
     gap: 10px;
-    padding: 10px 0 18px;
-    margin-bottom: 0;
+    padding: 8px 0 16px;
   }
 
   .tabs { width: 100%; }
-  .tabs button { flex: 1; padding: 8px 6px; font-size: 12px; }
-  .select-wrap { justify-content: space-between; padding: 0 2px 2px; }
-  .select-wrap select { min-width: 170px; }
+  .tabs button { flex: 1; margin-right: 4px; padding: 8px 4px; font-size: 11.5px; }
+  .tabs button:last-child { margin-right: 0; }
+  .select-wrap { justify-content: space-between; padding: 0 0 2px; }
+  .select-wrap select { min-width: 0; flex: 1; }
   .controls-right { width: 100%; flex-direction: column; align-items: stretch; gap: 10px; margin-left: 0; }
   .discover-button { width: 100%; }
 
   .now-grid { flex-direction: column; gap: 10px; }
   .now-grid > .now-card { flex-basis: auto; min-width: 0; width: 100%; max-width: 100%; }
-  .kpis { gap: 10px; }
-  .kpi:not(:last-child)::after { right: -5.5px; }
-  .kpi { padding: 24px 28px; }
+  .now-card { padding: 16px 0; }
+  .now-main { gap: 10px; }
+  .cover-lg { width: 64px; height: 64px; border-radius: 5px; }
+  .now-copy { padding-left: 0; }
+  .now-top { gap: 6px; }
+  .device-label { gap: 5px; }
+  .device-name { font-size: 10px; letter-spacing: 0.04em; }
+  .state-pill { padding: 6px 7px 5px; font-size: 9px; }
+  .level-meter { gap: 2px; height: 10px; }
+
+  .kpis { gap: 8px; }
+  .kpi:not(:last-child)::after { right: -4.5px; }
+  .kpi { padding: 16px; }
   .kpi strong { font-size: 22px; }
-  .card { padding: 24px 28px; }
-  .mood-row { grid-template-columns: 82px minmax(0, 1fr) 34px; gap: 8px; }
+  .kpi-sub { font-size: 10px; }
+
+  .columns { gap: 12px; }
+  .card { padding: 18px 16px; }
+  .stack > .card.mood-mix-card,
+  .stack > .card.artists-card,
+  .card.recent-plays-card { padding-left: 0; padding-right: 0; }
+  .rank-item { column-gap: 10px; padding: 10px 0; }
+  #top-tracks .rank-item:first-child { grid-template-columns: 64px minmax(0, 1fr) auto; }
+  #top-tracks .rank-item:first-child .cover { width: 64px; height: 64px; }
+  .mood-row { grid-template-columns: 70px minmax(0, 1fr) 32px; gap: 8px; }
+  .artist-grid { gap: 14px; }
   .timeline { gap: 4px; }
   .timeline-date { visibility: hidden; }
   .timeline-bar:first-child .timeline-date,
