@@ -376,11 +376,21 @@ function renderTimeline(timeline) {
   target.innerHTML = items.map((item) => {
     const height = Math.max(5, (item.plays / max) * 100);
     const mood = item.mood && item.mood !== 'unknown' ? item.mood : null;
-    const color = item.color ?? (mood ? moodColor(mood) : 'var(--accent)');
-    const label = mood ? ` · ${moodLabel(mood)}` : '';
-    return `<div class="timeline-bar" title="${esc(item.day)}: ${item.plays} plays${esc(label)}">
+    const color = mood ? (item.color ?? moodColor(mood)) : 'var(--accent)';
+    const mix = (item.moodMix ?? []).filter((entry) => entry.mood && entry.mood !== 'unknown' && Number(entry.plays) > 0);
+    const taggedPlays = mix.reduce((sum, entry) => sum + Number(entry.plays), 0);
+    const segments = mix.length
+      ? mix.map((entry) => {
+          const share = (Number(entry.plays) / taggedPlays) * 100;
+          const segmentColor = entry.color ?? moodColor(entry.mood, color);
+          return `<span style="height:${share.toFixed(2)}%;background:${esc(segmentColor)}" aria-hidden="true"></span>`;
+        }).join('')
+      : `<span style="height:100%;background:${esc(color)}" aria-hidden="true"></span>`;
+    const mixLabel = mix.map((entry) => `${moodLabel(entry.mood)} ${entry.plays}`).join(' · ');
+    const label = mixLabel ? ` · ${esc(mixLabel)}` : '';
+    return `<div class="timeline-bar" title="${esc(item.day)}: ${item.plays} plays${label}">
       <b class="timeline-count">${number(item.plays)}</b>
-      <i class="activity-fill" style="height:${height.toFixed(1)}%;background:${esc(color)}"></i>
+      <i class="activity-fill" style="height:${height.toFixed(1)}%">${segments}</i>
       <span class="timeline-date">${esc(String(item.day).slice(5))}</span>
     </div>`;
   }).join('');

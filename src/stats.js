@@ -119,12 +119,12 @@ function computeSummary(db, options = {}) {
        GROUP BY day
     ), day_moods AS (
       SELECT ${DAY_SQL} AS day,
-             m.mood AS mood,
+             COALESCE(m.mood, 'unknown') AS mood,
              COUNT(*) AS moodPlays
         FROM ${from}
         JOIN tracks t ON t.id = p.track_id
-        JOIN track_mood m ON m.track_id = t.id
-       WHERE ${where} AND m.mood IS NOT NULL
+        LEFT JOIN track_mood m ON m.track_id = t.id
+       WHERE ${where}
        GROUP BY day, mood
     ), day_tracks AS (
       SELECT ${DAY_SQL} AS day,
@@ -138,8 +138,8 @@ function computeSummary(db, options = {}) {
       SELECT day, mood,
              ROW_NUMBER() OVER (
                PARTITION BY day
-               ORDER BY moodPlays DESC,
-                        CASE WHEN mood = 'unknown' THEN 1 ELSE 0 END,
+               ORDER BY CASE WHEN mood = 'unknown' THEN 1 ELSE 0 END,
+                        moodPlays DESC,
                         mood
              ) AS rn
         FROM day_moods
@@ -151,7 +151,10 @@ function computeSummary(db, options = {}) {
              ) AS rn
         FROM day_tracks
     )
-    SELECT d.day, d.plays, d.playedMs, r.mood, rt.trackId
+    SELECT d.day, d.plays, d.playedMs, r.mood, rt.trackId,
+           (SELECT json_group_array(json_object('mood', mood, 'plays', moodPlays))
+              FROM day_moods dm
+             WHERE dm.day = d.day) AS moodMix
       FROM day_counts d
       LEFT JOIN ranked r ON r.day = d.day AND r.rn = 1
       LEFT JOIN ranked_tracks rt ON rt.day = d.day AND rt.rn = 1
@@ -159,6 +162,11 @@ function computeSummary(db, options = {}) {
   `).all(...timelineParams).map((row) => ({
     ...row,
     color: moodColor(row.mood),
+    moodMix: JSON.parse(row.moodMix ?? '[]')
+      .map((entry) => ({ ...entry, color: moodColor(entry.mood) }))
+      .sort((a, b) => Number(a.mood === 'unknown') - Number(b.mood === 'unknown')
+        || b.plays - a.plays
+        || String(a.mood).localeCompare(String(b.mood))),
   }));
 
   return {

@@ -560,7 +560,7 @@ test('play dedupe groups staggered multiroom plays but preserves distinct source
   assert.deepEqual(dedupePlayRows(rows), [1, 3, 4]);
 });
 
-test('timeline reports the dominant mood for each day', () => {
+test('timeline reports the dominant mood and mood mix for each day', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'melune-timeline-'));
   try {
     const db = openDb(dir);
@@ -584,6 +584,9 @@ test('timeline reports the dominant mood for each day', () => {
     assert.equal(summary.timeline.length, 1);
     assert.equal(summary.timeline[0].plays, 8);
     assert.equal(summary.timeline[0].mood, 'calm');
+    assert.deepEqual(summary.timeline[0].moodMix.map(({ mood, plays }) => [mood, plays]), [
+      ['calm', 2], ['sad', 1], ['unknown', 5],
+    ]);
     db.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
