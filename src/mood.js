@@ -3,7 +3,7 @@ import { normalizeText } from './util.js';
 const NO_MOOD_COLOR = '#6b7280';
 
 export const MOODS = {
-  happy: { label: 'Happy', color: '#d97706' },
+  happy: { label: 'Happy', color: '#e6bc02' },
   energetic: { label: 'Energetic', color: '#e11d48' },
   calm: { label: 'Calm', color: '#0284c7' },
   sad: { label: 'Sad', color: '#6366f1' },
@@ -11,7 +11,7 @@ export const MOODS = {
   romantic: { label: 'Romantic', color: '#db2777' },
   nostalgic: { label: 'Nostalgic', color: '#7c3aed' },
   aggressive: { label: 'Intense', color: '#ea580c' },
-  dreamy: { label: 'Dreamy', color: '#0d9488' },
+  dreamy: { label: 'Dreamy', color: '#8400db' },
 };
 
 const RULES = [
